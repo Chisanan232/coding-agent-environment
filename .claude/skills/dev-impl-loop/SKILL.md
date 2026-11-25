@@ -115,7 +115,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
         If the circuit opens, stop and escalate to the engineer.
 <!-- claude-only:start -->
       - Record the attempt for Fable escalation and follow the returned `action` (see "Blocker escalation to Fable" in
-        `engineering-workflow`); it asks the owner at most once per blocker and never blocks this loop.
+        `engineering-workflow`); it returns `CONSULT` at most once per blocker, follow it without asking the owner, and it never blocks this loop.
 <!-- claude-only:end -->
    e. If relative tests pass after a fix:
       ```bash

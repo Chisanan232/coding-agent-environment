@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fable cost estimate (SPE-176): the offer shows a list-price estimate before any invocation. Never calls a real model."""
+"""Fable cost estimate (SPE-176, SPE-171): a list-price estimate before any invocation. Never calls a real model."""
 import json
 import os
 import subprocess
@@ -39,14 +39,12 @@ class Estimate(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = os.path.join(self.tmp.name, "fable")
         os.makedirs(os.path.join(self.dir, "advice"), mode=0o700)
-        self.ask = os.path.join(self.tmp.name, "asks")
-        os.makedirs(self.ask, mode=0o700)
         self.stub = os.path.join(self.tmp.name, "claude")
         Path(self.stub).write_text(STUB)
         os.chmod(self.stub, 0o755)
         self.log = os.path.join(self.tmp.name, "stub.log")
-        self.saved = {k: os.environ.get(k) for k in ("FABLE_CLAUDE_BIN", "STUB_LOG", "FABLE_ESCALATION_DIR", "ASK_PENDING_DIR")}
-        os.environ.update(FABLE_CLAUDE_BIN=self.stub, STUB_LOG=self.log, FABLE_ESCALATION_DIR=self.dir, ASK_PENDING_DIR=self.ask)
+        self.saved = {k: os.environ.get(k) for k in ("FABLE_CLAUDE_BIN", "STUB_LOG", "FABLE_ESCALATION_DIR", "HOME")}
+        os.environ.update(FABLE_CLAUDE_BIN=self.stub, STUB_LOG=self.log, FABLE_ESCALATION_DIR=self.dir, HOME=self.tmp.name)
 
     def tearDown(self):
         for k, v in self.saved.items():
@@ -62,7 +60,8 @@ class Estimate(unittest.TestCase):
         self.assertIs(cost["invoked"], False)
         self.assertEqual(cost["model"], "claude-fable-5-2")
         argv = fe.consult_argv({})
-        self.assertEqual(cost["cap_usd"], float(argv[argv.index("--max-budget-usd") + 1]))
+        self.assertEqual(cost["cap_usd"], fe.PER_CONSULT_CEILING)  # the reservation; the client cap sits $1 below it
+        self.assertEqual(float(argv[argv.index("--max-budget-usd") + 1]), cost["cap_usd"] - 1)
         self.assertEqual(cost["estimated_usd_high"], cost["cap_usd"])
         self.assertTrue(0 < cost["estimated_usd_low"] <= cost["estimated_usd_high"])
         self.assertTrue(all(isinstance(b, str) and b for b in cost["basis"]))
@@ -82,7 +81,7 @@ class Estimate(unittest.TestCase):
 
     def test_basis_cites_the_documented_reference_points(self):
         basis = " ".join(fe.estimate_case(case())["basis"])
-        for fragment in ("$1.29", "$0.74", "46190", "3 bytes per token", "--max-budget-usd 4", "nothing was invoked"):
+        for fragment in ("$1.29", "$0.74", "46190", "3 bytes per token", "reservation ceiling $4.00", "--max-budget-usd 3.00", "nothing was invoked"):
             self.assertIn(fragment, basis)
 
     def test_reference_figures_match_their_records(self):
@@ -125,50 +124,29 @@ class Estimate(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("error", json.loads(proc.stdout))
 
-    def test_offer_carries_the_same_cost_and_the_owner_text(self):
-        packet = fe.offer(self.dir, case(), "sess-1", self.ask, T0)
-        self.assertEqual(packet["cost"], fe.estimate_case(case()))
-        self.assertNotIn("cost", fe.load(self.dir, packet["id"]))  # computed per display, never stored in the record
-        ask = packet["ask"]
-        cost = packet["cost"]
-        self.assertIn(f"${cost['estimated_usd_low']:.2f} to ${cost['estimated_usd_high']:.2f}", ask)
-        self.assertIn("capped at $4.00 per consult", ask)
-        self.assertIn("Nothing is invoked until you approve", ask)
-        self.assertIn("two_distinct_attempts_same_failure", ask)
-        self.assertIn("AC3 deadlock at step 4", packet["why_opus_insufficient"])
-        self.assertIn("Approve one read-only Fable consult for this blocker? (Approve / Decline). No reply: independent work continues.",
-                      ask)
-        self.assertEqual(fe.load(self.dir, packet["id"])["state"], fe.OFFERED)
+    def test_the_consult_path_carries_no_cost_prompt_and_the_estimate_matches_the_reservation(self):
+        text = (ROOT / "scripts/fable-escalation.py").read_text()
+        for gone in ("Approve one read-only", "Nothing is invoked until you approve", "packet_for", "why_opus_insufficient"):
+            self.assertNotIn(gone, text)
+        cost = fe.estimate_case(case())
+        self.assertEqual(cost["estimated_usd_high"], 4.0)
         self.assert_never_invoked()
 
-    def test_review_trigger_reason_names_the_positions(self):
-        review = {"unresolved_architecture_disagreement": True, "positions": ["shard the index", "one writer thread"]}
-        packet = fe.offer(self.dir, case(attempts=[], review=review), "sess-1", self.ask, T0)
-        self.assertIn("2 stated positions", packet["why_opus_insufficient"])
-        self.assertIn("unresolved_review_disagreement", packet["ask"])
+    def test_estimate_basis_states_the_client_cap_and_headroom(self):
+        basis = " ".join(fe.estimate_case(case())["basis"])
+        self.assertIn("checks only between turns", basis)
+        self.assertIn("$1 headroom", basis)
 
-    def test_show_and_attempt_packets_carry_cost(self):
-        packet = fe.offer(self.dir, case(), "sess-1", self.ask, T0)
-        self.assertEqual(fe.show(self.dir, packet["id"])["cost"], packet["cost"])
+    def test_a_dry_run_consult_without_authorization_refuses_and_never_invokes(self):
+        home = os.path.join(self.tmp.name, "home")
+        os.makedirs(home)
+        os.environ["HOME"] = home
         base = {"target": "o/r#8", "acceptance_check": "AC1 passes", "model": "claude-opus-5-5", "failure": "AC1 timeout at 30 s",
-                "question": "Which call blocks the event loop during AC1?", "non_sensitive": True}
-        fe.attempt(self.dir, dict(base, approach="cache the client"), "sess-1", self.ask, T0)
-        out = fe.attempt(self.dir, dict(base, approach="move to a thread pool"), "sess-1", self.ask, T0)
-        self.assertEqual(out["action"], "ASK_OWNER")
-        self.assertEqual(set(out["packet"]["cost"]), KEYS)
-        self.assert_never_invoked()
-
-    def test_invoke_still_refuses_without_an_owner_approval(self):
-        packet = fe.offer(self.dir, case(), "sess-1", self.ask, T0)
-        with self.assertRaisesRegex(fe.EscalationError, "only from a recorded approval"):
-            fe.consult(self.dir, packet["id"], True, self.tmp.name, T0)
-        self.assertEqual(fe.load(self.dir, packet["id"])["state"], fe.OFFERED)
-        self.assert_never_invoked()
-
-    def test_duplicate_offer_is_still_refused(self):
-        fe.offer(self.dir, case(), "sess-1", self.ask, T0)
-        with self.assertRaisesRegex(fe.EscalationError, "one offer and one consult per blocker"):
-            fe.offer(self.dir, case(), "sess-2", self.ask, T0)
+                "question": "Which call blocks the event loop during AC1?", "non_sensitive": True, "cwd": self.tmp.name}
+        fe.attempt(self.dir, dict(base, approach="cache the client"), "sess-1", T0)
+        out = fe.attempt(self.dir, dict(base, approach="move to a thread pool"), "sess-1", T0)
+        self.assertEqual((out["action"], out["reason"]), ("CONTINUE", "no_authorization"))
+        self.assertIn("opus-architect", out["fallback"])
         self.assert_never_invoked()
 
 
