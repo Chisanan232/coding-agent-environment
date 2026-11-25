@@ -73,8 +73,9 @@ RESERVED, SETTLED = "RESERVED", "SETTLED"
 
 # Text that must not reach a Fable prompt, nor be stored at `attempt`. First matching rule names the refusal.
 PAYLOAD_RULES = (
-    ("secret", re.compile(r"(?i)(token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|credential|authorization)\s*[=:]"
-                          r"|gh[opusr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|sk-ant-|AKIA[0-9A-Z]{16}|xox[abprs]-"
+    ("secret", re.compile(r"(?i)(token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|credential|authorization)[\w-]*[\"'\]]*\s*[=:]"
+                          r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|github_pat_[A-Za-z0-9_]{20,}|gh[opusr]_[A-Za-z0-9]{20,}"
+                          r"|(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}|sk-ant-|AKIA[0-9A-Z]{16}|xox[abprs]-"
                           r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*|-----BEGIN |[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@"
                           r"|(?=[A-Za-z0-9+/=]*[0-9])[A-Za-z0-9+/=]{40,}")),
     ("transcript", re.compile(r"(?m)^\s*(Human|Assistant):|\"role\"\s*:|\"type\"\s*:\s*\"(assistant|user|tool_use)\"|<system-reminder|"
@@ -316,29 +317,52 @@ def host_hash():
     return hashlib.sha256(found.group(1).encode()).hexdigest() if found else None
 
 
+GITHUB_REMOTE_RE = re.compile(r"(?:https://(?:[^@/\s]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
+                              r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?")
+
+
 def _git(cwd, *argv):
+    # A clean environment: an inherited GIT_DIR or GIT_WORK_TREE must not redirect the probe to another repository.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
-        proc = subprocess.run(["git", "-C", cwd, *argv], capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(["git", "-C", cwd, *argv], capture_output=True, text=True, timeout=30, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
-def origin_owner(cwd):
-    """GitHub owner of the `origin` remote (or the first remote) of the repository that holds `cwd`; None when unknown."""
+def origin_repo(cwd):
+    """(owner, repo), lowercase, of the `origin` remote (first remote if none) of the repository holding `cwd`; None when unknown.
+
+    The URL must be exactly a github.com https/ssh form: lookalike hosts, path-embedded `github.com` and other shapes do not parse."""
     top = _git(cwd, "rev-parse", "--show-toplevel")
     if not top:
         return None
     remotes = (_git(top, "remote") or "").split()
     if not remotes:
         return None
-    url = _git(top, "remote", "get-url", "origin" if "origin" in remotes else remotes[0]) or ""
-    found = re.search(r"github\.com[:/]([A-Za-z0-9_.-]+)/", url)
-    return found.group(1).lower() if found else None
+    found = GITHUB_REMOTE_RE.fullmatch(_git(top, "remote", "get-url", "origin" if "origin" in remotes else remotes[0]) or "")
+    return (found.group(1).lower(), found.group(2).lower()) if found else None
+
+
+def origin_owner(cwd):
+    repo = origin_repo(cwd)
+    return repo[0] if repo else None
+
+
+def repo_in_scope(target, cwd, owners):
+    """The target's owner is authorized and the working tree is a clone of exactly that repository."""
+    repo = origin_repo(cwd)
+    wanted = tuple(part.lower() for part in target.split("#", 1)[0].split("/", 1))
+    return repo is not None and repo == wanted and wanted[0] in owners
+
+
+PROFILE_RE = re.compile(r"status=(?P<status>none|ok) name=(?P<name>[A-Za-z0-9_.-]*) root=(?P<root>[^\n]*) overlay=(?P<overlay>[^\n]*)")
 
 
 def managed_session(cwd, allowed_profiles):
-    """True when this session looks company-managed: a managed-settings file exists (presence only) or a profile outside the allow list."""
+    """True when this session looks company-managed: a managed-settings file exists (presence only), or the profile resolver says
+    anything other than an exact `none`/allowed-`ok` answer. Unexpected output, a non-zero exit or a failure to run all count as managed."""
     if os.path.exists(MANAGED_SETTINGS):
         return True
     if not os.access(PROFILE_BIN, os.X_OK):
@@ -347,11 +371,61 @@ def managed_session(cwd, allowed_profiles):
         proc = subprocess.run([PROFILE_BIN, "resolve", "--cwd", cwd], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return True
-    fields = dict(part.split("=", 1) for part in proc.stdout.split() if "=" in part)
-    status = fields.get("status", "")
-    if status == "none":
+    found = PROFILE_RE.fullmatch(proc.stdout.strip()) if proc.returncode == 0 else None
+    if not found:
+        return True
+    if found["status"] == "none":
+        return found["name"] != ""
+    return found["name"] not in allowed_profiles
+
+
+EXPORT_MAX_FILES, EXPORT_MAX_FILE_BYTES, EXPORT_MAX_TOTAL_BYTES = 20000, 1 << 20, 64 << 20
+# Tracked files that look like credentials or tool configuration are not exported even though git tracks them.
+EXPORT_SKIP = re.compile(r"(?i)(^|/)(\.env[^/]*|\.npmrc|\.netrc|\.pypirc|\.git-credentials|id_(rsa|dsa|ecdsa|ed25519)[^/]*)$"
+                         r"|\.(pem|key|p12|pfx|jks|keystore|kdbx)$|(credential|secret|token|passwd|password)[^/]*$|^\.claude/|^\.codex/")
+
+
+def export_tracked(cwd, dest):
+    """Copy the tracked, non-credential-looking regular files of the repository holding `cwd` into `dest`. False when it cannot.
+
+    The consult reads only this copy: untracked files, ignored files, .env files and local tool settings never exist in it."""
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    if not top:
         return False
-    return not (status == "ok" and fields.get("name") in allowed_profiles)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        names = subprocess.run(["git", "-C", top, "ls-files", "-z"], capture_output=True, timeout=60, env=env).stdout.decode().split("\0")
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return False
+    total = count = 0
+    for name in filter(None, names):
+        src = os.path.join(top, name)
+        if EXPORT_SKIP.search(name) or os.path.islink(src) or not os.path.isfile(src):
+            continue
+        size = os.path.getsize(src)
+        if size > EXPORT_MAX_FILE_BYTES:
+            continue
+        count, total = count + 1, total + size
+        if count > EXPORT_MAX_FILES or total > EXPORT_MAX_TOTAL_BYTES:
+            return False
+        target = os.path.join(dest, name)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(src, "rb") as fin, open(target, "wb") as fout:
+            fout.write(fin.read())
+    return True
+
+
+def isolation_verdict():
+    """Static verdict (no model call): what the consult relies on and whether this CLI lists the flags. Honouring is UNVERIFIED."""
+    try:
+        text = subprocess.run([claude_bin(), "--help"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        text = ""
+    flags = ("--setting-sources", "--permission-mode", "--disallowedTools")
+    listed = all(f in text or f.lower().replace("tools", "-tools") in text.lower() for f in flags)
+    return {"cwd": "clean export of tracked, non-credential files only", "setting_sources": "project (the export has no .claude)",
+            "permission_mode": "dontAsk", "disallowed_tools": DISALLOWED_READS,
+            "cli_lists_flags": listed, "honoured_in_print_mode": "UNVERIFIED until the live case inspects the tool-use list"}
 
 
 def authorize(target, cwd, path=None, root=None, retention=True):
@@ -363,8 +437,7 @@ def authorize(target, cwd, path=None, root=None, retention=True):
         return None, "retention_unconfirmed"
     if host_hash() != auth["scope"]["host_sha256"]:
         return None, "scope_host_mismatch"
-    owners = auth["scope"]["repo_owners"]
-    if target.split("/", 1)[0].lower() not in owners or origin_owner(cwd) not in owners:
+    if not repo_in_scope(target, cwd, auth["scope"]["repo_owners"]):
         return None, "scope_repo_not_owned"
     if managed_session(cwd, auth["scope"]["allowed_profiles"]):
         return None, "managed_session"
@@ -402,7 +475,8 @@ def authorization_check(cwd, target, at, path=None, root=None):
                      "managed_session": managed_session(cwd, auth["scope"]["allowed_profiles"])},
            "caps": auth["caps"]}
     if target:
-        out["scope"]["target_owner"] = "owned" if target.split("/", 1)[0].lower() in owners else "scope_repo_not_owned"
+        out["scope"]["target_repo"] = "owned" if repo_in_scope(target, cwd, owners) else "scope_repo_not_owned"
+    out["isolation"] = isolation_verdict()
     try:
         out["month_budget"] = month_budget(auth, at)
     except LedgerError:
@@ -778,10 +852,10 @@ def consult_prompt(record):
 
 
 def consult_argv(record, per_consult=PER_CONSULT_CEILING):
-    # Whether --disallowedTools is honoured in -p mode is unverified (docs/fable/escalation.md); the prompt rule and the payload
-    # checks are the controls that do not depend on it.
+    # Whether these flags are honoured in -p mode is unverified (docs/fable/escalation.md). The real confinement is the cwd: a clean
+    # export of tracked files, with no user settings source; the denies are defense in depth.
     return [claude_bin(), "-p", "--model", FABLE_MODEL, "--tools", "Read,Grep,Glob", "--disallowedTools", DISALLOWED_READS,
-            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands", "--no-session-persistence",
+            "--permission-mode", "dontAsk", "--setting-sources", "project", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands", "--no-session-persistence",
             "--max-budget-usd", client_cap(per_consult), "--output-format", "json"]
 
 
@@ -838,11 +912,18 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
             save(directory, record)
             trip(directory, "route_failure", record["id"], at)
             raise EscalationError(record["failure"])
+        export = tempfile.TemporaryDirectory(prefix="fable-export-")
+        os.chmod(export.name, 0o700)
+        if not export_tracked(cwd, export.name):
+            export.cleanup()
+            return _refused(blocker_id, "isolation_export_failed")
         try:
             rid, month = ledger_reserve(auth, record["id"], record.get("session_id") or "unknown", at)
         except Refusal as exc:
+            export.cleanup()
             return _refused(blocker_id, exc.reason)  # quota state, not a route failure: the breaker stays closed
         except LedgerError:
+            export.cleanup()
             return _refused(blocker_id, "ledger_unreadable")
         # Persist CONSULTING after the reservation and before the call: a crash or kill leaves both the consult and its $ spent.
         record["state"], record["consult_started"], record["reservation"] = CONSULTING, iso(at), {"rid": rid, "month": month}
@@ -851,7 +932,7 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
     cost, problems = None, []
     try:
         # The prompt goes on stdin so attempt text never appears in a process listing.
-        proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, cwd=cwd, timeout=CONSULT_TIMEOUT_S)
+        proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, cwd=export.name, timeout=CONSULT_TIMEOUT_S)
         result = json.loads(proc.stdout)
         if not isinstance(result, dict):
             raise ValueError("result is not a JSON object")
@@ -859,6 +940,8 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
         problems = ([] if proc.returncode == 0 else [f"exit {proc.returncode}"]) + check_route(result)
     except Exception as exc:  # noqa: BLE001 - every non-success exit must trip the breaker, whatever raised
         result, problems = {}, [type(exc).__name__]
+    finally:
+        export.cleanup()
     # A KeyboardInterrupt/SystemExit is not caught above: the entry then stays RESERVED at the full amount, never auto-released.
     settled_at = now_utc()
     if cost is None:
@@ -1013,7 +1096,10 @@ def main(argv=None):
             reset_breaker(directory, args.note, at)
             out = {"breaker": breaker(directory)}
     except (EscalationError, OSError, ValueError) as exc:
-        print(json.dumps({"error": str(exc)}))
+        failure = {"error": str(exc)}
+        if args.cmd == "consult":
+            failure["fallback"] = FALLBACK  # a failed consult never blocks the work: continue on the baseline
+        print(json.dumps(failure))
         return 2
     print(json.dumps(out, indent=1, sort_keys=True))
     return 0 if args.cmd != "evaluate" or out["eligible"] else 1

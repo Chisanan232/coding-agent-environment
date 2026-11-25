@@ -34,6 +34,11 @@ FAKE_CLAUDE = '''#!/usr/bin/env python3
 import json, os, sys
 if "--version" in sys.argv:
     print(os.environ.get("FAKE_VERSION", "2.1.325 (Claude Code)")); sys.exit(0)
+if "--help" in sys.argv:
+    print("  --setting-sources <s>\\n  --permission-mode <m>\\n  --disallowedTools, --disallowed-tools <tools...>"); sys.exit(0)
+if os.environ.get("FAKE_CWD_LOG"):
+    open(os.environ["FAKE_CWD_LOG"], "a").write(json.dumps({"cwd": os.getcwd(), "files": sorted(
+        os.path.relpath(os.path.join(d, f), os.getcwd()) for d, _, fs in os.walk(os.getcwd()) for f in fs)}) + "\\n")
 open(os.environ["FAKE_LOG"], "a").write(json.dumps(sys.argv[1:]) + "\\n")
 print(os.environ["FAKE_OUT"]); sys.exit(int(os.environ.get("FAKE_RC", "0")))
 '''
@@ -408,6 +413,35 @@ class Authorization(Env):
         self.tearDown_state()
         self.assertEqual(self.two_attempts(cwd=bare)["reason"], "scope_repo_not_owned")
 
+    def test_remote_urls_are_parsed_structurally_and_must_name_the_target_repository(self):
+        tricks = ("https://evil.example/github.com/o/r.git", "https://github.com.evil.example/o/r.git", "https://o@github.com.evil.example/o/r",
+                  "https://evil.example/x@github.com/o/r", "git@github.com.evil.example:o/r.git", "https://github.com/o/r/extra",
+                  "ssh://evil@github.com/o/r", "file:///srv/github.com/o/r", "https://github.comx/o/r", "https://github.com/o")
+        for url in tricks:
+            with self.subTest(url):
+                self.tearDown_state()
+                other = self.make_repo("trick", url)
+                self.assertEqual(fe.origin_repo(other), None)
+                self.assertEqual(self.two_attempts(cwd=other)["reason"], "scope_repo_not_owned")
+                subprocess.run(["rm", "-rf", other])
+        for url in ("https://github.com/o/r.git", "https://user:tok@github.com/o/r", "ssh://git@github.com/o/r.git", "git@github.com:O/R.git",
+                    "https://github.com/o/r/"):
+            with self.subTest(url):
+                other = self.make_repo("good", url)
+                self.assertEqual(fe.origin_repo(other), ("o", "r"))
+                subprocess.run(["rm", "-rf", other])
+
+    def test_the_working_tree_must_be_a_clone_of_the_target_repository_not_just_an_owned_one(self):
+        self.assertEqual(self.two_attempts(target="o/other#7")["reason"], "scope_repo_not_owned")
+
+    def test_an_inherited_git_dir_cannot_redirect_the_remote_probe(self):
+        elsewhere = self.make_repo("elsewhere", "https://github.com/stranger/x.git")
+        os.environ["GIT_DIR"] = os.path.join(elsewhere, ".git")
+        try:
+            self.assertEqual(fe.origin_repo(self.repo), ("o", "r"))
+        finally:
+            del os.environ["GIT_DIR"]
+
     def test_managed_settings_file_makes_the_session_company_managed(self):
         Path(fe.MANAGED_SETTINGS).write_text("{}")
         self.refused_at_attempt("managed_session")
@@ -422,6 +456,31 @@ class Authorization(Env):
         self.write_auth(scope={"allowed_profiles": ["corp"]})
         self.tearDown_state()
         self.assertEqual(self.two_attempts()["action"], "CONSULT")
+
+    def resolver(self, body, rc=0):
+        path = os.path.join(self.tmp.name, "resolver")
+        Path(path).write_text(f"#!/bin/sh\n{body}\nexit {rc}\n")
+        os.chmod(path, 0o755)
+        subprocess.run([path], capture_output=True, timeout=300)  # absorb the first-launch stall
+        fe.PROFILE_BIN = path
+
+    def test_profile_resolver_output_that_is_not_an_exact_answer_is_company_managed(self):
+        for name, body, rc in (("garbage", "echo hello", 0), ("empty", "true", 0), ("extra line", "echo 'status=none name= root= overlay='; echo more", 0),
+                               ("none with a name", "echo 'status=none name=corp root= overlay='", 0),
+                               ("unresolved", "echo 'status=unresolved name=x root=/r overlay=/o'", 4),
+                               ("ok but nonzero", "echo 'status=ok name=mine root=/r overlay=/o'", 3),
+                               ("none but nonzero", "echo 'status=none name= root= overlay='", 2),
+                               ("extra tokens", "echo 'status=ok name=mine extra=1 root=/r overlay=/o'", 0),
+                               ("prefix junk", "echo 'x status=none name= root= overlay='", 0)):
+            with self.subTest(name):
+                self.resolver(body, rc)
+                self.write_auth(scope={"allowed_profiles": ["mine"]})
+                self.assertTrue(fe.managed_session(self.repo, ["mine"]), name)
+        self.resolver("echo 'status=none name= root= overlay='")
+        self.assertFalse(fe.managed_session(self.repo, []))
+        self.resolver("echo 'status=ok name=mine root=/r overlay=/o'")
+        self.assertFalse(fe.managed_session(self.repo, ["mine"]))
+        self.assertTrue(fe.managed_session(self.repo, ["other"]))
 
     def test_authorization_template_and_check_are_read_only_and_never_write_the_file(self):
         before = Path(self.auth_path).read_bytes()
@@ -438,7 +497,10 @@ class Authorization(Env):
         os.chmod(self.auth_path, 0o600)
         out = fe.authorization_check(self.repo, "o/r#7", T0)
         self.assertEqual(out["authorization"], "ok")
-        self.assertEqual((out["scope"]["host"], out["scope"]["cwd_repo_owner"], out["scope"]["target_owner"]), ("match", "owned", "owned"))
+        self.assertEqual((out["scope"]["host"], out["scope"]["cwd_repo_owner"], out["scope"]["target_repo"]), ("match", "owned", "owned"))
+        self.assertEqual(out["isolation"]["permission_mode"], "dontAsk")
+        self.assertTrue(out["isolation"]["cli_lists_flags"])
+        self.assertIn("UNVERIFIED", out["isolation"]["honoured_in_print_mode"])
         self.assertEqual(out["month_budget"]["remaining_usd"], 40.0)
         self.assertNotIn(HOST, json.dumps(out))  # the check prints verdicts, not the host hash
 
@@ -462,6 +524,28 @@ class Consult(Env):
             self.assertIn(rule, denied)
         for flag in ("--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"):
             self.assertIn(flag, argv)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "project")
+
+    def test_the_consult_runs_in_a_clean_export_of_tracked_credential_free_files_and_removes_it(self):
+        for name, body in (("src/a.py", "print(1)"), (".env", "X=1"), ("deploy.pem", "k"), ("src/api_token.txt", "t"), (".claude/settings.json", "{}"),
+                           ("docs/readme.md", "hi")):
+            path = Path(self.repo, name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body)
+        Path(self.repo, "untracked.txt").write_text("u")
+        subprocess.run(["git", "-C", self.repo, "add", "src/a.py", ".env", "deploy.pem", "src/api_token.txt", ".claude/settings.json", "docs/readme.md"],
+                       check=True, capture_output=True)
+        seen = os.path.join(self.tmp.name, "cwd.log")
+        os.environ["FAKE_CWD_LOG"] = seen
+        try:
+            self.consult(self.ready())
+        finally:
+            del os.environ["FAKE_CWD_LOG"]
+        row = json.loads(Path(seen).read_text().splitlines()[0])
+        self.assertEqual(row["files"], ["docs/readme.md", "src/a.py"])
+        self.assertNotEqual(os.path.realpath(row["cwd"]), os.path.realpath(self.repo))
+        self.assertFalse(os.path.exists(row["cwd"]))  # removed after the call
 
     def test_consult_reserves_calls_once_and_settles_the_reported_cost(self):
         bid = self.ready()
@@ -735,13 +819,16 @@ class BreakerAndFallback(Env):
 
 
 class Payload(Env):
-    BAD = (("secret", "api_key = abc123"), ("secret", "token: xyz"), ("secret", "key sk-ant-api03-abcdef"), ("secret", "xoxb-1234-abcd"),
-           ("secret", "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig"), ("secret", "-----BEGIN PRIVATE KEY-----"),
+    BAD = (("secret", "api_key = abc123"), ("secret", "token: xyz"), ("secret", "key sk-" + "ant-api03-abcdef"), ("secret", "xox" + "b-1234-abcd"),
+           ("secret", "jwt ey" + "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig"), ("secret", "-----BEGIN " + "PRIVATE KEY-----"),
            ("secret", "see https://user:hunter2@example.com/x"), ("secret", "blob " + "A1b2C3d4" * 6),
            ("transcript", "Human: please fix it"), ("transcript", "line one\nAssistant: ok"), ("transcript", '{"role": "assistant"}'),
            ("transcript", '{"type":"tool_use"}'), ("transcript", "<system-reminder>x</system-reminder>"),
            ("transcript", "read ~/.claude/projects/p/s.jsonl"), ("transcript", "see run.jsonl"),
-           ("email", "mail me at someone@example.com"))
+           ("email", "mail me at someone@example.com"),
+           ("secret", '{"api_key": "abc"}'), ("secret", "'secret': 'x'"), ("secret", "token_value=abc"), ("secret", "password-hash: x"),
+           ("secret", "Authorization: Bearer abcdefgh12345678"), ("secret", "sent Bearer abcdefgh12345678"),
+           ("secret", "github_pat_" + "A1b2C3d4E5f6G7h8I9j0K1l2"), ("secret", "key sk-" + "proj_" + "abcdefghijklmnopqrstu"))
 
     def test_text_that_breaks_a_rule_is_not_stored_at_attempt_and_is_reported_not_counted(self):
         for rule, text in self.BAD:
@@ -973,6 +1060,18 @@ class WorkflowCases(WorkflowBase):
                 extra = {"cause": cause} if cause else {}
                 self.assertEqual(self.attempt(approach + failure, failure=failure, check="AC " + failure, **extra)["action"], "CONTINUE", failure)
         self.assertFalse(Path(self.dir, "receipts.log").exists())
+
+    def test_provider_failures_print_the_fallback_and_are_charged_as_reported(self):
+        for out, rc, charged in ((dict(FABLE_OK, total_cost_usd=0.9), "1", 0.9), (dict(FABLE_OK, is_error=True, total_cost_usd=1.5), "0", 1.5),
+                                 (dict(FABLE_OK, modelUsage={"claude-opus-5-5": {}}, total_cost_usd=0.4), "0", 0.4)):
+            self.tearDown()
+            self.setUp()
+            os.environ["FAKE_OUT"], os.environ["FAKE_RC"] = json.dumps(out), rc
+            failure = self.cli("consult", "--id", self.ready_cli(), "--execute", "--cwd", self.repo, rc=2)
+            self.assertIn("breaker opened", failure["error"])
+            self.assertIn("sonnet + opus-architect", failure["fallback"])
+            self.assertEqual(self.month()["entries"][0]["charged_usd"], charged)
+            self.assertTrue(fe.breaker(self.dir)["open"])
 
     def test_failed_consult_stops_all_escalation_without_repeat_calls(self):
         bid = self.ready_cli()
