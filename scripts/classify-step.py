@@ -21,23 +21,28 @@ import sys
 
 LIGHT, BUILD_CRATE, BUILD_WORKSPACE, CONTAINER = "light", "build-crate", "build-workspace", "container-suite"
 ORDER = {LIGHT: 0, BUILD_CRATE: 1, BUILD_WORKSPACE: 2, CONTAINER: 3}
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+LOCAL_DIR = os.path.expanduser("~/.config/coding-agent-environment/local")
 DEFAULT_TRUST = os.path.expanduser("~/.config/coding-agent-environment/local/local-first-ci.json")
 
+# git runs hooks (pre-commit, pre-push, post-checkout) and `rebase --exec` / `bisect run` run commands, so only these never do.
+GIT_LIGHT = {"status", "diff", "log", "show", "rev-parse", "ls-files", "ls-remote", "describe", "blame", "cat-file", "rev-list", "for-each-ref", "fetch", "add"}
+GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
 PASS_THROUGH = {"rtk", "env", "time", "nice", "command", "exec", "nohup"}
 UV_FLAGS_WITH_VALUE = {"--no-binary-package", "--no-build-package", "--no-binary", "--index", "--index-url", "--default-index", "--resolution", "--prerelease", "--package", "--reinstall-package", "--upgrade-package", "--with", "--extra", "--group", "--python", "-p", "--project", "--directory", "--env-file", "--with-requirements"}
 CARGO_LIGHT = {"fmt", "metadata", "tree", "locate-project", "audit", "deny", "search", "version", "--version", "-V", "help", "vendor"}
 CARGO_HEAVY = {"build", "b", "test", "t", "nextest", "clippy", "check", "c", "bench", "doc", "run", "r", "llvm-cov", "tarpaulin", "miri", "install"}
-CARGO_PACKAGE_SELECTORS = {"-p", "--package", "--bin", "--lib", "--test", "--example", "--bench", "--manifest-path"}
+CARGO_PACKAGE_SELECTORS = {"-p", "--package"}   # --lib/--bin/--test/--manifest-path still compile every member at a virtual-workspace root
 DOCKER_LIGHT = {"ps", "inspect", "version", "info", "logs", "images", "ls", "stats", "context", "port"}
 DOCKER_BINARIES = {"docker", "podman", "nerdctl", "docker-compose", "podman-compose"}
 NATIVE_GATE = {"pytest", "py.test", "mypy", "pyright", "tox", "nox", "pip-audit", "pip_audit", "coverage", "tsc", "vitest", "jest", "mvn", "gradle", "gradlew"}
 NODE_HEAVY = {"test", "build", "ci", "install", "i", "e2e", "lint:ci", "typecheck", "compile"}
 GO_HEAVY = {"build", "test", "vet", "install"}
 MAKE_HEAVY = {"test", "build", "all", "check", "ci", "docker"}
-LIGHT_BINARIES = {"git", "gh", "jq", "yq", "grep", "rg", "ls", "cat", "head", "tail", "sed", "awk", "sort", "uniq", "wc", "diff", "find", "echo",
+LIGHT_BINARIES = {"gh", "jq", "yq", "grep", "rg", "ls", "cat", "head", "tail", "sort", "uniq", "wc", "diff", "echo",
                   "printf", "test", "true", "false", "sleep", "mkdir", "cp", "mv", "touch", "stat", "date", "basename", "dirname", "tr", "cut",
                   "ruff", "black", "isort", "shellcheck", "yamllint", "markdownlint", "codespell", "gitleaks", "actionlint", "curl", "shasum",
-                  "sha256sum", "readlink", "realpath", "wait", "tee", "xargs"}
+                  "sha256sum", "readlink", "realpath", "wait", "tee"}
 WRAPPER_SCRIPT = "owner-merge-local-ci.py"
 PINNED_SCRIPTS = {"local-pip-audit.py": (LIGHT, "owner-pinned short dependency audit"),
                   "local-agent-python-check.py": (BUILD_CRATE, "owner-pinned Python journey test suite")}
@@ -45,6 +50,11 @@ PINNED_SCRIPTS = {"local-pip-audit.py": (LIGHT, "owner-pinned short dependency a
 
 def _is_assignment(token):
     return "=" in token and not token.startswith("-") and token.split("=", 1)[0].replace("_", "").isalnum()
+
+
+def _under(path, directory):
+    """True when `path` resolves to a file directly inside `directory` (a same-named script elsewhere is not the pinned one)."""
+    return os.path.dirname(os.path.realpath(path)) == os.path.realpath(directory)
 
 
 def strip_wrappers(argv):
@@ -111,7 +121,9 @@ def classify(argv, trust_file=DEFAULT_TRUST, _depth=0):
         return _unknown("empty command")
     base, args = os.path.basename(tokens[0]), tokens[1:]
     script = next((a for a in args if not a.startswith("-")), "") if base.startswith("python") else ""
-    if os.path.basename(script) == WRAPPER_SCRIPT:
+    wrapper = os.path.basename(script) == WRAPPER_SCRIPT and _under(script, SCRIPT_DIR)
+    pinned = os.path.basename(script) in PINNED_SCRIPTS and _under(script, LOCAL_DIR)
+    if wrapper:
         if _depth:
             return _unknown("nested trust-file wrapper")
         checks = _trusted_checks(args, trust_file)
@@ -122,9 +134,9 @@ def classify(argv, trust_file=DEFAULT_TRUST, _depth=0):
             return _unknown("a pinned check is not recognised: " + "; ".join(p["reason"] for p in parts if p["weight"] == "unknown")[:200])
         top = max(parts, key=lambda p: ORDER[p["class"]])
         return _result(top["class"], f"heaviest of {len(parts)} pinned checks: {top['reason']}")
-    if any(a in ("--help", "-h", "--version", "-V") for a in args):
-        return _result(LIGHT, f"{base} with a help/version flag only prints")
-    if os.path.basename(script) in PINNED_SCRIPTS:
+    if len(args) == 1 and args[0] in ("--help", "-h", "--version", "-V") and base not in DOCKER_BINARIES | {"mvn", "gradle", "gradlew"}:
+        return _result(LIGHT, f"{base} with only a help/version flag prints and exits")
+    if pinned:
         return _result(*PINNED_SCRIPTS[os.path.basename(script)])
     if base in DOCKER_BINARIES:
         sub = next((a for a in args if not a.startswith("-")), "")
@@ -144,6 +156,12 @@ def classify(argv, trust_file=DEFAULT_TRUST, _depth=0):
     if base == "make":
         sub = next((a for a in args if not a.startswith("-")), "")
         return _result(BUILD_CRATE, f"make {sub} is a native build/test") if sub in MAKE_HEAVY else _unknown(f"make {sub or '(default)'} is not in the table")
+    if base == "git":
+        rest, i = args, 0
+        while i < len(rest) and rest[i].startswith("-"):
+            i += 2 if rest[i] in GIT_GLOBAL_WITH_VALUE else 1
+        sub = rest[i] if i < len(rest) else ""
+        return _result(LIGHT, f"git {sub} is read-only and runs no hook") if sub in GIT_LIGHT else _unknown(f"git {sub or '(none)'} may run hooks or commands")
     if base in LIGHT_BINARIES:
         return _result(LIGHT, f"{base} is a short read/inspect/format/lint command")
     return _unknown(f"{base} is not recognised (scripts, bash -c and pre-commit hide their work)")
