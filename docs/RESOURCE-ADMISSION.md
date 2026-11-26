@@ -273,7 +273,8 @@ class left pytest gates charged the whole host):
   `build-workspace` with `--bytes` of at least its default. Only the top-level file is read; a nested script is the owner's declaration.
 - A pinned `uvx --from pytest==X pytest` (or mypy, pyright) run takes `--no-cargo-target` under `--class auto`: memory, CPU and disk are
   charged, but no exclusion key is taken and the job is not serialised behind cargo jobs. `uvx` without `--from NAME==VERSION` is
-  unknown. Declare the flag yourself only for a job that cannot invoke cargo.
+  unknown. Residual risk, accepted: argv cannot show that a pinned `--with` package or a pytest plugin/suite calls cargo; a pure-Python
+  repo is the intended use, and a repo whose tests build Rust must declare `--cargo-target-dir` (which keeps the key). Declare the flag yourself only for a job that cannot invoke cargo.
 - An omitted `--class` is classified like `--class auto` (light runs at once, heavy takes its class and a raised `--bytes`); only a
   command the classifier cannot name stays classless with the warning. `bash -c 'cd DIR && export PYTHONPATH=...; uvx --from
   pytest==X pytest ... > LOG 2>&1; echo "exit=$?" >> LOG'` is read in that exact shape; pipes, substitutions and subshells are unknown.

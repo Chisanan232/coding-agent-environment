@@ -315,10 +315,11 @@ def _shell_chain(script, trust_file, depth):
     its own. Anything else (pipes, substitutions, subshells, background `&`, here-docs, globs, a variable in any word) is unknown, and
     the result is the heaviest segment. Argv only: the script file is not read, and a hostile checkout stays out of scope as documented."""
     import shlex
-    if depth or len(script) > 4096 or any(c in script for c in "`\n\r|(){}<*[~\\"):
+    if depth or len(script) > 4096 or any(c in script for c in "`\n\r|(){}<*[~\\#"):
         return _unknown("bash -c script uses a construct this classifier does not model")
     lexer = shlex.shlex(script, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
+    lexer.commenters = ""                   # shlex would end the line at a mid-word `#`; bash does not
     try:
         words = list(lexer)
     except ValueError:

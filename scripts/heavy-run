@@ -293,7 +293,7 @@ def parse(argv):
 SHELL_BINARIES = {"bash", "sh", "zsh"}
 CMD_START = r"(?:^|[;&|{(]|\bthen\b|\bdo\b)[ \t]*"
 TARGET_ASSIGN = re.compile(r"""(?m)""" + CMD_START + r"""(?:export[ \t]+)?(?:[A-Za-z_]+=\S*[ \t]+)*CARGO_TARGET_DIR=("[^"\n]*"|'[^'\n]*'|[^\s;&|]+)""")
-WORKSPACE_CARGO = re.compile(r"(?m)" + CMD_START + r"(?:[A-Za-z_]+=\S*[ \t]+)*cargo[ \t]+(?:\+\S+[ \t]+)?(?:build|b|test|t|nextest[ \t]+run|clippy|check|doc)\b[^\n|;&]*[ \t]--(?:workspace|all)(?![\w-])")
+WORKSPACE_CARGO = re.compile(r"(?m)" + CMD_START + r"(?:(?:env|time|command|nohup)[ \t]+|[A-Za-z_]+=\S*[ \t]+)*cargo[ \t]+(?:(?:\+|-)\S*[ \t]+)*(?:build|b|test|t|nextest[ \t]+run|clippy|check|doc)\b[^\n|;&]*[ \t]--(?:workspace|all)(?![\w-])")
 WORKSPACE_BYTES = 40 * 2**30
 CLASS_ORDER = {"build-crate": 1, "build-workspace": 2}
 
@@ -345,9 +345,9 @@ def prepare(args, env):
     if declared and args.no_cargo_target:
         return "--cargo-target-dir and --no-cargo-target contradict each other"
     if declared and args.cargo_target_dir:
-        for flag in ("--target-dir",):
-            if flag in args.command or any(a.startswith(flag + "=") for a in args.command):
-                return "the command names its own --target-dir; use --cargo-target-dir for the key instead of both"
+        inline = text if text is not None else ""
+        if any(a == "--target-dir" or a.startswith("--target-dir=") for a in args.command) or re.search(r"--target-dir\b", inline):
+            return "the command or its script names its own --target-dir; use --cargo-target-dir for the key instead of both"
     if declared:
         env["CARGO_TARGET_DIR"] = declared
         env.pop("CARGO_BUILD_TARGET_DIR", None)
