@@ -15,7 +15,7 @@ subagent fan-out. Run `scripts/memory-admission.py check --weight heavy` first; 
 | Physical RAM and compressed memory | `hw.memsize`, `vm_stat` "occupied by compressor" | A large compressor share means the machine is already holding memory it cannot drop cheaply |
 | Swap used **and** sustained swap I/O | `vm.swapusage`, swapins+swapouts over a measured window | Used swap alone is history; the I/O rate is current behaviour |
 | Disk and swap-growth headroom | free bytes of the Data volume | Swap files grow on that volume; a full disk means swap cannot grow |
-| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu, rss and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | Up to two heavy lanes, a third as a pilot in the stable and wide tiers (each beyond the first only when the resource budget passes, the third also needing the disk margin; ADR 0017 revisions 2, 7, 11 and 12), counted as a process tree (workload), not per process; see "Idle orphans" below |
+| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu, rss and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | Up to three heavy lanes in the stable tier and four in the wide tier (each beyond the first only when the resource budget passes, lanes 3 and 4 also needing their disk margins; ADR 0017 revisions 2, 7, 11, 12 and 14), counted as a process tree (workload), not per process; see "Idle orphans" below |
 | Load per core | `getloadavg` / CPU count | Scheduler saturation that RAM numbers do not show |
 | Reservations and ownership | the existing `disk-admission.py` gate (reserve, lane cap, process identity) | Task ownership already lives there; it is not duplicated |
 
@@ -323,7 +323,7 @@ Arithmetic (`budget_decision(host, reservations, request, caps)`, pure):
 Known gaps. All constants are guesses until `measurements` backs them. A heavy-named process the process list could not parse
 into a tree is not counted as unmanaged. `status` reads records without verification (it takes no lock), so it can briefly show a
 holder that has just exited. A 2 s window is shorter than the 10 s `memory-admission check` uses, so its swap-I/O reading is
-noisier, so a noisy sample can only close a second lane, never open one. The third lane is approved and shipped (margin PR #293, stable tier PR #294); `THIRD_LANE_ENABLED = False` is the kill switch. Lane 4 is still off and needs a head-protection follow-up before it is enabled.
+noisier, so a noisy sample can only close a second lane, never open one. The third lane is approved and shipped (margin PR #293, stable tier PR #294); `THIRD_LANE_ENABLED` and `FOURTH_LANE_ENABLED` are both `True` (ADR 0017 revisions 12-14); reverting the reviewed flip PR is the rollback, there is no flag file.
 
 Known and accepted. The `shadow-budget` lines share `queue/receipts.jsonl` (and its single 1 MiB rotation) with the queue's own
 receipts, so a busy shadow stream rotates queue history sooner. The `budget` result key is additive: a caller that compares
