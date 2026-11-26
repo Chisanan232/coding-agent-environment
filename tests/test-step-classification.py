@@ -157,6 +157,14 @@ class Classifier(unittest.TestCase):
                        ['python3', RECORDER, 'evidence', '--repo', 'o/r', '--pr', '1', '--head', 'h'], base + ['--repo=o/r', *tail]):
             self.assertEqual(self.kind(*forged, trust=trust)[0], 'unknown', forged)
 
+    def test_fifth_review_launcher_and_module_paths_and_cargo_flags_before_the_subcommand(self):
+        for argv in (('./env', 'ls'), ('./rtk', 'ls'), ('./timeout', '5', 'ls'), ('./nohup', 'ls'), ('/tmp/x/env', 'ls'),
+                     ('/tmp/x/python3', '-m', 'ruff', 'check'), ('./python3', '-m', 'json.tool'), ('cargo', '--config', 'version', 'build'),
+                     ('cargo', '+nightly', '-C', 'tree', '-Z', 'unstable-options', 'build'), ('markdownlint', '-c', 'x.cjs', 'f.md')):
+            self.assertEqual(self.kind(*argv)[0], 'unknown', argv)
+        self.assertEqual(self.kind('cargo', '+nightly', 'build', '-p', 'x'), ('heavy', 'build-crate'))
+        self.assertEqual(self.kind('/usr/bin/env', 'ls'), ('light', 'light'))
+
     def test_only_package_selectors_scope_cargo_to_one_package(self):
         self.assertEqual(self.kind('cargo', 'test', '-p', 'one', '--lib'), ('heavy', 'build-crate'))
         self.assertEqual(self.kind('cargo', 'test', '--package=one'), ('heavy', 'build-crate'))
