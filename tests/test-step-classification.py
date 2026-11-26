@@ -77,7 +77,7 @@ class Classifier(unittest.TestCase):
         return handle.name
 
     def test_the_local_ci_recorder_takes_the_heaviest_pinned_check(self):
-        record = ['python3', RECORDER, 'record', '--repo', 'o/r', '--pr', '1']
+        record = ['python3', RECORDER, 'record', '--repo', 'o/r', '--pr', '1', '--base', 'main', '--worktree', '/x']
         py = self.trust([['uv', 'run', 'ruff', 'check'], ['uv', 'run', 'pytest'], ['uv', 'build']])
         self.assertEqual(self.kind(*record, trust=py), ('heavy', 'build-crate'))
         rust = self.trust([['cargo', 'fmt'], ['cargo', 'build', '--workspace']])
@@ -88,10 +88,10 @@ class Classifier(unittest.TestCase):
         self.assertEqual(self.kind(*record, trust=docs), ('light', 'light'))
 
     def test_the_recorder_is_unknown_without_pinned_checks_or_with_an_unrecognised_one(self):
-        record = ['python3', RECORDER, 'record', '--repo', 'o/r', '--pr', '1']
+        record = ['python3', RECORDER, 'record', '--repo', 'o/r', '--pr', '1', '--base', 'main', '--worktree', '/x']
         self.assertEqual(self.kind(*record, trust=NO_TRUST)[0], 'unknown')
         self.assertEqual(self.kind(*record, trust=self.trust([['pytest'], ['./odd.sh']]))[0], 'unknown')
-        other = ['python3', RECORDER, 'record', '--repo', 'other/repo', '--pr', '1']
+        other = ['python3', RECORDER, 'record', '--repo', 'other/repo', '--pr', '1', '--base', 'main', '--worktree', '/x']
         self.assertEqual(self.kind(*other, trust=self.trust([['pytest']]))[0], 'unknown')
 
     def test_nothing_that_can_run_a_heavy_command_is_ever_light(self):
@@ -137,6 +137,26 @@ class Classifier(unittest.TestCase):
         self.assertEqual(self.kind('gh', 'pr', 'view', '3'), ('light', 'light'))
         self.assertEqual(self.kind('rg', 'foo', 'x'), ('light', 'light'))
 
+    def test_fourth_review_paths_abbreviations_deny_lists_and_the_recorders_exact_form(self):
+        not_light = (('./test',), ('bin/test',), ('./wait',), ('/tmp/x/cargo', '--help'),
+                     ('git', 'ls-remote', '--upload-p=/p.sh', '.'), ('git', 'fetch', '--upload-pa', 'P'), ('git', 'fetch'), ('git', 'add', '.'),
+                     ('git', 'diff', '--ext-d'), ('git', 'log', '--exec-path=x'),
+                     ('rg', '--hostname-bin=P'), ('rg', '--hostname-bin', 'P'), ('actionlint', '--shellcheck=x'), ('actionlint', '--pyflakes', 'x'),
+                     ('markdownlint', '-rx.js', 'f.md'), ('gh', 'pr', '-R', 'view', 'checkout', '1'), ('gh', 'pr', '--repo', 'view', 'create'))
+        for argv in not_light:
+            self.assertNotEqual(self.kind(*argv)[0], 'light', argv)
+        for argv in (('git', 'diff', '--cached', '--stat'), ('git', '-C', '/x', 'log', '--oneline', '-5'), ('git', 'status', '--short', '--branch'),
+                     ('/usr/bin/git', 'status'), ('rg', 'foo'), ('gh', 'pr', 'view', '3', '--json', 'x')):
+            self.assertEqual(self.kind(*argv)[0], 'light', argv)
+        trust = self.trust([['pytest']])
+        base = ['python3', RECORDER, 'record']
+        tail = ['--pr', '1', '--base', 'main', '--worktree', '/x']
+        self.assertEqual(self.kind(*base, '--repo', 'o/r', *tail, trust=trust)[0], 'heavy')
+        for forged in (base + ['--repo', 'LIGHT/R', '--rep', 'o/r', *tail], base + ['--repo', 'o/r', '--repo=x/y', *tail],
+                       base + ['--repo', 'o/r', '--config', '/x.json', *tail], base + ['--repo', 'o/r', *tail, '--repo', 'a/b'],
+                       ['python3', RECORDER, 'evidence', '--repo', 'o/r', '--pr', '1', '--head', 'h'], base + ['--repo=o/r', *tail]):
+            self.assertEqual(self.kind(*forged, trust=trust)[0], 'unknown', forged)
+
     def test_only_package_selectors_scope_cargo_to_one_package(self):
         self.assertEqual(self.kind('cargo', 'test', '-p', 'one', '--lib'), ('heavy', 'build-crate'))
         self.assertEqual(self.kind('cargo', 'test', '--package=one'), ('heavy', 'build-crate'))
@@ -146,7 +166,7 @@ class Classifier(unittest.TestCase):
         self.assertEqual(self.kind('docker', '--version')[0], 'heavy')       # docker has no light table entry for a bare flag
 
     def test_a_same_named_script_elsewhere_is_not_the_pinned_one(self):
-        elsewhere = ['python3', '/tmp/owner-merge-local-ci.py', 'record', '--repo', 'o/r', '--pr', '1']
+        elsewhere = ['python3', '/tmp/owner-merge-local-ci.py', 'record', '--repo', 'o/r', '--pr', '1', '--base', 'main', '--worktree', '/x']
         self.assertEqual(self.kind(*elsewhere, trust=self.trust([['pytest']]))[0], 'unknown')
         self.assertEqual(self.kind('python3', '/tmp/local-pip-audit.py')[0], 'unknown')
         self.assertEqual(self.kind('python3', '/tmp/local-agent-python-check.py')[0], 'unknown')
@@ -209,7 +229,7 @@ class UnderContention(unittest.TestCase):
 
     def test_a_heavy_step_stays_queued_and_does_not_run_while_every_lane_is_held(self):
         self.mode('held')
-        code, err = self.heavy_run([str(self.dir / 'bin' / 'pytest'), '-q'])
+        code, err = self.heavy_run(['pytest', '-q'])
         self.assertEqual(code, hr.TIMEOUT_EXIT, err)           # not admitted within --max-wait-s
         self.assertFalse(self.ran('pytest'))
         enqueue = [a for a in self.runner_calls() if a[:2] == ['queue', 'enqueue']][0]
@@ -217,13 +237,13 @@ class UnderContention(unittest.TestCase):
 
     def test_an_unrecognised_step_is_refused_before_it_queues(self):
         self.mode('held')
-        code, err = self.heavy_run([str(self.dir / 'bin' / 'dependent')])
+        code, err = self.heavy_run(['dependent'])
         self.assertEqual(code, 64, err)
         self.assertEqual(self.runner_calls(), [])
         self.assertFalse(self.ran('dependent'))
 
     def test_a_dependent_step_waits_for_its_prerequisite_and_resumes_after_success(self):
-        pytest = str(self.dir / 'bin' / 'pytest')
+        pytest = 'pytest'          # a bare name: the classifier distrusts a path outside the system tool directories; PATH finds the shim
         self.mode('held')                                      # prerequisite queued behind occupied lanes: not admitted, not run
         code, _ = self.heavy_run([pytest])
         self.assertNotEqual(code, 0)
@@ -239,7 +259,7 @@ class UnderContention(unittest.TestCase):
     def test_a_heavy_step_that_fails_does_not_release_its_dependent(self):
         self.mode('free')
         self.env['FAKE_COMMAND_RC'] = '3'
-        code, _ = self.heavy_run([str(self.dir / 'bin' / 'pytest')])
+        code, _ = self.heavy_run(['pytest'])
         self.assertEqual(code, 3)                              # the step's own exit code reaches `&&`
 
 
