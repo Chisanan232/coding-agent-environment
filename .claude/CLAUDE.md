@@ -259,6 +259,7 @@ Before heavy work run `scripts/memory-admission.py check --weight heavy` from th
 SPE-109 disk gate; it is not installed into `~/.claude`); run only the
 heavy lanes the scheduler grants (the cap `heavy_lane_cap` in `scripts/disk-admission.py` computes for the current disk tier: up to three lanes in the stable tier (the third only while its 60 GiB margin passes), up to four in the wide tier when every lane-3 and lane-4 margin and the resource budget pass, as the monitored pilot of ADR 0017 revisions 11-14; never above that cap), never kill or delete another session's work, and treat a swap-used number as history, not current
 exhaustion. After a reboot treat earlier processes, locks, reservations and jobs as stale and reconcile before resuming.
+Classify each step by the work it does: `scripts/classify-step.py -- <command>`. Only a heavy step enters the queue (`scripts/heavy-run --class auto ...`, run in the background); a light step (docs, review, git/gh, lint, ticket work, narrow reads) runs at once whatever the lanes hold and never waits behind your own queued step; a step waits only for a queued step whose result it needs. Declare an unrecognised step from the class table in `docs/RESOURCE-ADMISSION.md`; never submit one classless.
 Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate.
 
 <!-- coding-agent-environment:baseline:merge-sequence:start -->
