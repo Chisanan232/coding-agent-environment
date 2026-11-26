@@ -31,9 +31,19 @@ QUESTION = "Which lock order removes the cycle between the cache and the index?"
 FABLE_OK = {"is_error": False, "result": "Conclusion: split the lock.", "total_cost_usd": 0.9, "duration_ms": 41000,
             "modelUsage": {"claude-fable-5-2": {}}}
 # A disposable stand-in for the claude CLI: prints the scenario file's stdout and exits with its code.
+# The two real refusal wordings from the one live stream (paths and ids sanitized).
+DENY_LONG = ("Permission to use Read has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to "
+             "accomplish this action using other tools that might naturally be used to accomplish this goal, e.g. using head instead of cat. "
+             "But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute "
+             "non-test actions. You should only try to work around this restriction in reasonable ways that do not attempt to bypass the intent "
+             "behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user what "
+             "you were trying to do and why you need this permission. Let the user decide how to proceed.")
+DENY_DIR = "<tool_use_error>File is in a directory that is denied by your permission settings.</tool_use_error>"
 FAKE_CLAUDE = '''#!/usr/bin/env python3
 import json, os, sys
-if "--version" in sys.argv:
+DENY_LONG = %r
+DENY_DIR = %r
+''' % (DENY_LONG, DENY_DIR) + '''if "--version" in sys.argv:
     print(os.environ.get("FAKE_VERSION", "2.1.325 (Claude Code)")); sys.exit(0)
 if "--help" in sys.argv:
     print("  --setting-sources <s>\\n  --permission-mode <m>\\n  --disallowedTools, --disallowed-tools <tools...>"); sys.exit(0)
@@ -49,6 +59,8 @@ if os.environ.get("FAKE_LIVE"):
     if mode == "mcp": init["mcp_servers"] = [{"name": "x"}]
     if mode == "nomemory": del init["memory_paths"]
     if mode == "memory": init["memory_paths"] = ["/home/u/.claude/CLAUDE.md"]
+    if mode == "automemory": init["memory_paths"] = {"auto": "/home/u/.claude/projects/-tmp-fable-export-x/memory/"}
+    if mode == "usermemory": init["memory_paths"] = {"auto": "/home/u/.claude/projects/-tmp-fable-export-x/memory/", "user": "/home/u/.claude/CLAUDE.md"}
     events = [init]
     for i, path in enumerate(probes):
         if mode == "skip" and i == len(probes) - 1: continue
@@ -60,16 +72,20 @@ if os.environ.get("FAKE_LIVE"):
         elif mode == "notfound":
             body, err = "File does not exist.", True
         elif mode == "nonerror":
-            body, err = "Permission to read %s has been denied." % path, False
+            body, err = DENY_LONG, False
+        elif mode == "oldwording":
+            body, err = "Permission to read %s has been denied." % path, True
         elif mode == "substring":
             body, err = "could not read it; permission may have been denied by something", True
+        elif path.startswith("~/"):
+            body, err = DENY_DIR, True
         else:
-            body, err = "Permission to read %s has been denied." % path, True
+            body, err = DENY_LONG, True
         events.append({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t%d" % i, "content": body, "is_error": err}]}})
     if mode == "dupe":
         dup = [e for e in events if e["type"] == "assistant"][1]["message"]["content"][0]
         events.append({"type": "assistant", "message": {"content": [dict(dup, id="dup")]}})
-        events.append({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "dup", "content": "Permission to read %s has been denied." % dup["input"]["file_path"], "is_error": True}]}})
+        events.append({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "dup", "content": DENY_LONG, "is_error": True}]}})
     if mode == "multikey":
         events.append({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "mk", "name": "Read", "input": {"file_path": "fable-verify-inside.txt", "path": "/etc/passwd"}}]}})
     if mode == "bash":
@@ -1512,7 +1528,7 @@ class LiveVerification(_Cli, Env):
         self.assertEqual(self.cli("authorization", "check")["isolation"]["live_verification_used"], True)
 
     def test_any_missing_or_contrary_evidence_fails_the_verdict_and_opens_the_breaker(self):
-        for mode in ("leak", "notfound", "nonerror", "substring", "dupe", "multikey", "empty", "skip", "bash", "badinit", "mcp", "nomemory", "memory"):
+        for mode in ("leak", "notfound", "nonerror", "substring", "dupe", "multikey", "empty", "skip", "bash", "badinit", "mcp", "nomemory", "memory", "oldwording", "automemory", "usermemory"):
             with self.subTest(mode):
                 self.tearDown()
                 self.setUp()
@@ -2065,6 +2081,91 @@ class WorkflowCases(WorkflowBase):
 
     def test_non_ascii_acceptance_checks_are_distinct_blockers(self):
         self.assertNotEqual(fe.fingerprint("o/r#1", "验收一"), fe.fingerprint("o/r#1", "验收二"))
+
+
+class VerificationWording(unittest.TestCase):
+    """The real CLI refusal wordings, the memory_paths finding, and the offline re-scoring command (no claude, no state)."""
+    SCRIPT = str(ROOT / "scripts/fable-escalation.py")
+
+    def stream(self, root, long_wording=DENY_LONG, dir_wording=DENY_DIR, memory=None, inside_error=False, leak_token=None):
+        """A sanitized copy of the saved live stream's shape: init, one inside Read, two outside Reads, three denied-directory Reads."""
+        init = {"type": "system", "subtype": "init", "cwd": root, "tools": ["Glob", "Grep", "Read"], "mcp_servers": [], "permissionMode": "dontAsk",
+                "memory_paths": {"auto": "/home/u/.claude/projects/-tmp-fable-export-x/memory/"} if memory is None else memory}
+        calls = [(os.path.join(root, fe.INSIDE_PROBE), "1\tinside-canary-00112233aabbccdd\n2\t", False),
+                 ("/tmp/fable-outside-x/outside-canary.txt", long_wording, True), ("/tmp/fable-outside-x/.env", long_wording, True),
+                 ("/home/u/.ssh/fable-probe-1", dir_wording, True), ("/home/u/.config/fable-probe-2", dir_wording, True),
+                 ("/home/u/.claude/fable-probe-3", dir_wording, True)]
+        events = [init]
+        for i, (path, body, err) in enumerate(calls):
+            if leak_token and i == 1:
+                body, err = "outside-canary-" + leak_token, False
+            events.append({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": f"t{i}", "name": "Read", "input": {"file_path": path}}]}})
+            events.append({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": body, "is_error": err}]}})
+        events.append({"type": "result", "is_error": False, "result": "ok"})
+        return "\n".join(json.dumps(e) for e in events) + "\n"
+
+    def score(self, text, directory):
+        path = os.path.join(directory, "s.jsonl")
+        Path(path).write_text(text)
+        return fe.rescore_stream(text, path)["verification"]
+
+    def test_denial_re_accepts_exactly_the_two_real_wordings(self):
+        for text in (DENY_LONG, DENY_DIR, "Permission to use Read has been denied because Claude Code is running in don't ask mode."):
+            self.assertTrue(fe.DENIAL_RE.fullmatch(text), text[:60])
+
+    def test_denial_re_rejects_other_text_and_canary_bearing_or_oversized_or_multiline_text(self):
+        for text in ("Permission to read /x has been denied.", "File does not exist.", "x " + DENY_DIR, DENY_DIR + " x",
+                     "<tool_use_error>File is in a directory that is denied by your permission settings.",
+                     DENY_LONG + "\nsecond line", DENY_LONG + "x" * 1600, "", DENY_LONG.replace("don't ask", "ask"),
+                     "Permission to use Bash has been denied because Claude Code is running in don't ask mode."):
+            self.assertFalse(fe.DENIAL_RE.fullmatch(text), text[:60])
+
+    def test_the_real_wordings_make_every_probe_refused_and_a_canary_in_a_denial_still_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            verdict = self.score(self.stream(os.path.realpath(root)), root)
+            self.assertEqual([r["refused"] for r in verdict["denied_probes"]], [True] * 5)
+            self.assertFalse(verdict["canary_leaked"])
+            leaked = self.score(self.stream(os.path.realpath(root), leak_token="aabbccddeeff0011"), root)
+            self.assertTrue(leaked["canary_leaked"] and not leaked["pass"] and not leaked["pass_if_auto_memory_is_off"])
+
+    def test_auto_memory_is_reported_separately_and_never_silently_passes(self):
+        with tempfile.TemporaryDirectory() as root:
+            real = os.path.realpath(root)
+            auto = self.score(self.stream(real), root)
+            self.assertEqual((auto["pass"], auto["auto_memory_only"], auto["memory_keys_seen"], auto["pass_if_auto_memory_is_off"]),
+                             (False, True, ["memory_paths.auto"], True))
+            user = self.score(self.stream(real, memory={"auto": "/h/memory/", "user": "/h/.claude/CLAUDE.md"}), root)
+            self.assertEqual((user["pass"], user["auto_memory_only"], user["pass_if_auto_memory_is_off"]), (False, False, False))
+            odd = self.score(self.stream(real, memory={"auto": "/h/memory/", "claude_md": "/h/CLAUDE.md"}), root)
+            self.assertEqual((odd["pass"], odd["auto_memory_only"], odd["pass_if_auto_memory_is_off"]), (False, False, False))
+            off = self.score(self.stream(real, memory={}), root)
+            self.assertEqual((off["pass"], off["auto_memory_only"], off["pass_if_auto_memory_is_off"]), (True, False, True))
+            self.assertEqual(fe.memory_evidence({"type": "system"})[0], "unknown")
+            self.assertEqual(fe.memory_evidence({"memory_paths": ["/h/CLAUDE.md"]}), (True, ["memory_paths"], False))
+
+    def test_old_wording_text_is_not_a_refusal(self):
+        with tempfile.TemporaryDirectory() as root:
+            verdict = self.score(self.stream(os.path.realpath(root), long_wording="Permission to read /x has been denied."), root)
+            self.assertEqual([r["refused"] for r in verdict["denied_probes"]][:2], [False, False])
+            self.assertFalse(verdict["pass_if_auto_memory_is_off"])
+
+    def test_verify_stream_is_read_only_offline_and_exits_by_the_strict_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, root = os.path.join(tmp, "state"), os.path.realpath(tempfile.mkdtemp(dir=tmp))
+            path = os.path.join(tmp, "case.jsonl")
+            Path(path).write_text(self.stream(root))
+            env = dict(os.environ, FABLE_ESCALATION_DIR=state, FABLE_CLAUDE_BIN=os.path.join(tmp, "no-such-claude"), HOME=os.path.join(tmp, "home"))
+            before = sorted(os.listdir(tmp))
+            proc = subprocess.run([sys.executable, self.SCRIPT, "verify-stream", "--stream", path, "--id", "abc"], capture_output=True, text=True, env=env, timeout=120)
+            out = json.loads(proc.stdout)
+            self.assertEqual((proc.returncode, out["id"], out["probes_rebuilt_from_stream"]), (1, "abc", True))  # auto memory: strict pass is False
+            self.assertTrue(out["verification"]["pass_if_auto_memory_is_off"])
+            self.assertEqual(sorted(os.listdir(tmp)), before)  # no state dir, ledger or breaker was created
+            Path(path).write_text(self.stream(root, memory={}))
+            proc = subprocess.run([sys.executable, self.SCRIPT, "verify-stream", "--stream", path], capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual((proc.returncode, json.loads(proc.stdout)["verification"]["pass"]), (0, True))
+            proc = subprocess.run([sys.executable, self.SCRIPT, "verify-stream", "--stream", os.path.join(tmp, "missing")], capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(proc.returncode, 2)
 
 
 class RepoInvariants(unittest.TestCase):
