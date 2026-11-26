@@ -737,7 +737,8 @@ def excl_keys_clash(a, b):
     return bool(set(excl_identity(a)) & set(excl_identity(b)))
 
 
-def resolve_workload(name, mem_gib, cpus, nbytes, env=None, home=None, cwd=None, session_id=None, ticket=None, now=None, argv=None):
+def resolve_workload(name, mem_gib, cpus, nbytes, env=None, home=None, cwd=None, session_id=None, ticket=None, now=None, argv=None,
+                     cargo_target=True):
     """(fields, error). fields is {} when nothing was declared (the legacy meaning), else the optional record fields.
 
     Unknown class names fail closed. --mem-gib, --cpus and --bytes may raise an estimate and never lower it below the class
@@ -780,11 +781,13 @@ def resolve_workload(name, mem_gib, cpus, nbytes, env=None, home=None, cwd=None,
         fields['test_threads'] = slots
     if spec:
         env = os.environ if env is None else env
-        if spec['excl'] == 'target':
+        if spec['excl'] == 'target' and not cargo_target:
+            key = None      # a job declared not to use a Cargo target (a pure-Python gate) takes no target exclusion
+        elif spec['excl'] == 'target':
             key = CARGO_KEY + _cargo_target_dir(env, home if home is not None else account_home(), cwd or os.getcwd(), argv)
         else:
             key = spec['excl']
-        fields['excl_keys'] = [key]
+        fields['excl_keys'] = [key] if key else []
     elif name is not None:
         fields['excl_keys'] = []
     fields['created'] = iso_utc(now or datetime.now(timezone.utc))
@@ -4121,11 +4124,15 @@ def _add_workload_args(parser):
                         ', '.join(sorted(WORKLOAD_CLASSES)))
     parser.add_argument('--mem-gib', type=float, dest='mem_gib', help='declared memory estimate; may raise the class default, never lower it')
     parser.add_argument('--cpus', type=int, dest='cpus', help='declared CPU slots; may raise the class default, never lower it')
+    parser.add_argument('--no-cargo-target', action='store_true', dest='no_cargo_target',
+                        help='the job runs no Cargo build (a pure-Python gate): the class takes no Cargo-target exclusion. Memory, CPU and disk '
+                             'are still charged; never declare it for a job that can invoke cargo')
 
 
 def _declared_from_args(args, nbytes, session_id=None, ticket=None, argv=None):
     """(fields, error) for the CLI: resolves the declared class and estimates without executing anything."""
-    return resolve_workload(args.workload_class, args.mem_gib, args.cpus, nbytes, session_id=session_id, ticket=ticket, argv=argv)
+    return resolve_workload(args.workload_class, args.mem_gib, args.cpus, nbytes, session_id=session_id, ticket=ticket, argv=argv,
+                            cargo_target=not getattr(args, 'no_cargo_target', False))
 
 
 def build_parser():

@@ -21,6 +21,7 @@ a hostile checkout is out of scope; and a symlink inside a trusted tool director
 import argparse
 import json
 import os
+import re
 import sys
 
 LIGHT, BUILD_CRATE, BUILD_WORKSPACE, CONTAINER = "light", "build-crate", "build-workspace", "container-suite"
@@ -81,8 +82,11 @@ def _is_assignment(token):
     return "=" in token and not token.startswith("-") and token.split("=", 1)[0].replace("_", "").isalnum()
 
 
-def _result(klass, reason):
-    return {"weight": "light" if klass == LIGHT else "heavy", "class": klass, "reason": reason}
+def _result(klass, reason, cargo=None):
+    out = {"weight": "light" if klass == LIGHT else "heavy", "class": klass, "reason": reason}
+    if cargo is False:
+        out["cargo"] = False      # a pinned pure-Python tool run: heavy-run declares --no-cargo-target (no Cargo-target exclusion)
+    return out
 
 
 def _unknown(reason):
@@ -236,7 +240,7 @@ def _classify_core(tokens, notes, trust_file, depth):
     if base == "<module>":
         name = args[0]
         if name in NATIVE_GATE:
-            return _result(BUILD_CRATE, f"python -m {name} is a native test/type gate")
+            return _result(BUILD_CRATE, f"python -m {name} is a native test/type gate", cargo=False)
         return _result(LIGHT, f"python -m {name} is a formatter") if name in MODULE_LIGHT else _unknown(f"python -m {name} is not in the table")
     script = args[0] if base.startswith("python") and args and not args[0].startswith("-") else ""
     if script and os.path.basename(script) == WRAPPER_SCRIPT and _under(script, SCRIPT_DIR):
@@ -263,15 +267,15 @@ def _classify_core(tokens, notes, trust_file, depth):
     if base in ("cargo", "cargo-nextest"):
         return _cargo(args if base == "cargo" else ["nextest"] + args)
     if base in NATIVE_GATE:
-        return _result(BUILD_CRATE, f"{base} is a native test/type gate (no docker, no cargo target)")
+        return _result(BUILD_CRATE, f"{base} is a native test/type gate (no docker, no cargo target)", cargo=False)
     if base in ("npm", "pnpm", "yarn", "bun"):
         sub = next((a for a in args if not a.startswith("-") and a not in ("run", "exec")), "")
-        return _result(BUILD_CRATE, f"{base} {sub} is a native build/test") if sub in NODE_HEAVY else _unknown(f"{base} {sub or '(none)'} is not in the table")
+        return _result(BUILD_CRATE, f"{base} {sub} is a native build/test", cargo=False) if sub in NODE_HEAVY else _unknown(f"{base} {sub or '(none)'} is not in the table")
     if base == "go":
         sub = args[0] if args else ""
-        return _result(BUILD_CRATE, f"go {sub} is a native build/test") if sub in GO_HEAVY else _unknown(f"go {sub or '(none)'} is not in the table")
+        return _result(BUILD_CRATE, f"go {sub} is a native build/test", cargo=False) if sub in GO_HEAVY else _unknown(f"go {sub or '(none)'} is not in the table")
     if base == "uv" and args[:1] == ["build"]:
-        return _result(BUILD_CRATE, "uv build compiles a wheel")
+        return _result(BUILD_CRATE, "uv build compiles a wheel", cargo=False)
     if base == "make":
         sub = next((a for a in args if not a.startswith("-")), "")
         return _result(BUILD_CRATE, f"make {sub} is a native build/test") if sub in MAKE_HEAVY else _unknown(f"make {sub or '(default)'} is not in the table")
@@ -288,7 +292,104 @@ def _classify_core(tokens, notes, trust_file, depth):
         if any(_denied(a, LIGHT_BINARIES[base]) for a in args):
             return _unknown(f"{base} option that executes a program")
         return _result(LIGHT, f"{base} is a short read/inspect/format/lint command")
-    return _unknown(f"{base} is not recognised (scripts, bash -c and pre-commit hide their work)")
+    if base == "uvx":
+        return _uvx(args, trust_file, depth)
+    if base in SHELLS and len(args) == 2 and args[0] == "-c":
+        return _shell_chain(args[1], trust_file, depth)
+    return _unknown(f"{base} is not recognised (scripts and pre-commit hide their work; `bash -c` is read only in the cd/export/command/log-redirect shape)")
+
+
+SHELL_ENV_OK = {"PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "RUSTUP_TOOLCHAIN", "RUST_BACKTRACE", "CI", "CARGO_TARGET_DIR"}
+SHELLS = {"bash", "sh", "zsh"}
+
+
+def _redirect_ok(path):
+    """A log-file redirect target: absolute, literal, inside the account's home (the caller's own files), no `..`."""
+    return (os.path.isabs(path) and "$" not in path and ".." not in path.split("/")
+            and os.path.realpath(path).startswith(os.path.expanduser("~") + os.sep))
+
+
+def _shell_chain(script, trust_file, depth):
+    """`bash -c SCRIPT` for the one shape agents write around a gate: `cd DIR && export NAME=literal; CMD ARGS > LOG 2>&1; echo "exit=$?"
+    >> LOG`. Segments split on `&&` and `;`; each is a `cd`, an allow-listed `export`, the exit-code echo, or one command classified on
+    its own. Anything else (pipes, substitutions, subshells, background `&`, here-docs, globs, a variable in any word) is unknown, and
+    the result is the heaviest segment. Argv only: the script file is not read, and a hostile checkout stays out of scope as documented."""
+    import shlex
+    if depth or len(script) > 4096 or any(c in script for c in "`\n\r|(){}<*[~\\"):
+        return _unknown("bash -c script uses a construct this classifier does not model")
+    lexer = shlex.shlex(script, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        words = list(lexer)
+    except ValueError:
+        return _unknown("bash -c script does not parse")
+    segments, current = [], []
+    for word in words:
+        if word in ("&&", ";"):
+            segments.append(current)
+            current = []
+        elif set(word) <= set("&;<>|") and word not in (">", ">>", ">&"):
+            return _unknown(f"bash -c shell operator {word!r} is not modelled")
+        else:
+            current.append(word)
+    segments.append(current)
+    parts = []
+    for seg in segments:
+        i = 0
+        while i < len(seg):                      # strip log redirects: `> F`, `>> F`, `2 >& 1`
+            if seg[i] in (">", ">>") and i + 1 < len(seg) and _redirect_ok(seg[i + 1]):
+                del seg[i:i + 2]
+            elif seg[i:i + 3] == ["2", ">&", "1"]:
+                del seg[i:i + 3]
+            else:
+                i += 1
+        if any(w in (">", ">>", ">&") for w in seg):
+            return _unknown("bash -c redirect to a path outside the account's home or in an unmodelled form")
+        if not seg:
+            return _unknown("empty bash -c segment")
+        if seg[0] == "cd" and len(seg) == 2 and "$" not in seg[1] and os.path.isabs(seg[1]):
+            continue
+        if seg[0] == "export" and len(seg) == 2 and "=" in seg[1]:
+            name, value = seg[1].split("=", 1)
+            if name in SHELL_ENV_OK and "$" not in value:
+                continue
+            return _unknown(f"export {name} is not in the allowed list")
+        if seg == ["echo", "exit=$?"]:
+            continue
+        if any("$" in w for w in seg):
+            return _unknown("a shell variable in a bash -c word")
+        parts.append(classify(seg, trust_file, depth + 1))
+    if not parts:
+        return _unknown("bash -c script runs nothing recognisable")
+    bad = [p for p in parts if p["weight"] == "unknown"]
+    if bad:
+        return _unknown("bash -c segment: " + bad[0]["reason"])
+    heavy = [p for p in parts if p["weight"] == "heavy"] or parts
+    top = dict(max(heavy, key=lambda p: ORDER.get(p["class"], 0) if p["class"] else -1))
+    if any(p["weight"] == "heavy" and p.get("cargo") is not False for p in parts):
+        top.pop("cargo", None)       # one segment may use cargo: keep the exclusion
+    return top
+
+
+def _uvx(args, trust_file, depth):
+    """`uvx [--python V] [--from NAME==VER] [--with NAME==VER]... TOOL ARGS`: a pinned tool run. The tool must be the `--from` package (or
+    no `--from`), so a pinned wheel cannot run a different executable. Classified as the tool itself (pytest and mypy are native gates)."""
+    i, source = 0, None
+    while i < len(args) and args[i].startswith("-"):
+        flag = args[i]
+        if flag in ("--python", "-p") and i + 1 < len(args):
+            i += 2
+        elif flag == "--from" and i + 1 < len(args) and re.fullmatch(r"[A-Za-z0-9_.-]+==[0-9][A-Za-z0-9.+!-]*", args[i + 1]):
+            source, i = args[i + 1].split("==")[0], i + 2
+        elif flag == "--with" and i + 1 < len(args) and re.fullmatch(r"[A-Za-z0-9_.-]+==[0-9][A-Za-z0-9.+!-]*", args[i + 1]):
+            i += 2
+        else:
+            return _unknown(f"uvx flag {flag} is not a pinned form")
+    if i >= len(args):
+        return _unknown("uvx without a tool")
+    if source is not None and args[i] != source:
+        return _unknown("uvx tool differs from its --from package")
+    return classify(args[i:], trust_file, depth + 1)
 
 
 def classify(argv, trust_file=DEFAULT_TRUST, depth=0):
