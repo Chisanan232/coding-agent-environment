@@ -241,10 +241,20 @@ def _terminate(signum, _frame):
     raise SystemExit(128 + signum)
 
 
+def classify_auto(command):
+    """The step classifier next to this file (scripts/classify-step.py), loaded fresh so the checkout's own rules apply."""
+    from importlib.util import module_from_spec, spec_from_file_location
+    spec = spec_from_file_location("classify_step", os.path.join(os.path.dirname(os.path.realpath(__file__)), "classify-step.py"))
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.classify(command)
+
+
 def parse(argv):
     parser = argparse.ArgumentParser(prog="heavy-run", add_help=True, allow_abbrev=False)
     parser.add_argument("--label", required=True, help="reservation label, [A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
-    parser.add_argument("--class", dest="workload_class", help="declared workload class (see disk-admission.py run --help)")
+    parser.add_argument("--class", dest="workload_class", help="declared workload class (see disk-admission.py run --help), or 'auto' to let scripts/classify-step.py decide: "
+                        "a light step runs at once outside any lane, a heavy one takes the class it names, an unrecognised one is refused (64)")
     parser.add_argument("--bytes", type=int, required=True, help="disk bytes to reserve (at least the class default)")
     parser.add_argument("--ttl-s", type=int, default=4 * 3600)
     parser.add_argument("--max-wait-s", type=int, default=3600)
@@ -278,6 +288,20 @@ def main(argv=None, env=None):
         except OSError as exc:
             print(f"heavy-run: cannot run {args.command[0]}: {exc}", file=sys.stderr)
             return 127
+    if args.workload_class == "auto":
+        verdict = classify_auto(args.command)
+        print(f"heavy-run: --class auto: {verdict['weight']} ({verdict['class']}): {verdict['reason']}", file=sys.stderr)
+        if verdict["weight"] == "unknown":
+            print("heavy-run: refusing to guess; declare --class (docs/RESOURCE-ADMISSION.md, step classification) or run a light step directly.",
+                  file=sys.stderr)
+            return 64
+        if verdict["weight"] == "light":
+            try:
+                return exit_code(subprocess.call(args.command, env=env))
+            except OSError as exc:
+                print(f"heavy-run: cannot run {args.command[0]}: {exc}", file=sys.stderr)
+                return 127
+        args.workload_class = verdict["class"]
     if not args.workload_class:
         print("heavy-run: WARNING no --class: the runner records an unknown workload and charges the host's whole resource budget.",
               file=sys.stderr)

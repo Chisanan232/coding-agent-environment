@@ -238,6 +238,27 @@ to be lowered only by a reviewed constants change backed by `disk-admission.py m
 | `container-suite` | 4 GiB | 4 / 2 | 20 GiB | `docker` |
 | none (legacy) | whole budget | all cores | as given | none |
 
+### Step classification (which step is heavy)
+
+Classify each step by the work it actually does, not by the session or the ticket. `scripts/classify-step.py -- COMMAND...` prints
+the answer as JSON (exit 3 when it does not recognise the command; it never guesses and never reads anything but the owner's pinned
+local-CI trust file for the recorder). Only a heavy step enters the queue, through `scripts/heavy-run --class auto ...` started in the
+background; a light step runs at once, whatever the lanes hold and whether or not another step of the same session is queued.
+A step waits only for a queued step whose result it needs (`heavy-run` returns the step's own exit code, 75 when not admitted, so
+`&&` and `wait` carry the dependency). An unrecognised step is declared by the caller from this table, never submitted classless.
+
+| Work | Class | Notes |
+|---|---|---|
+| `cargo build/test/clippy/check --workspace`, or any cargo step with no package selector | `build-workspace` | |
+| `cargo ... -p crate`, `--lib`, `--bin`, `--test` | `build-crate` | |
+| pytest, mypy, `uv build`, npm/pnpm test or build, `go test`, `make test` | `build-crate` | native gate: no docker, no cargo target, so no exclusion key |
+| `owner-merge-local-ci.py record` | heaviest class among the checks pinned for that repo | a Python repo is `build-crate`; it is not a container suite unless a pinned check runs containers |
+| docker, podman, compose that run containers | `container-suite` | takes the `docker` key, serialising behind real container suites |
+| git, gh, jq, grep/rg, ruff, formatters, docs and link checks, review, ticket work, narrow reads | light | do not queue |
+
+A step that wraps several checks is classified by its heaviest one; split a step whose light parts would otherwise wait behind a
+heavy one. Never submit a classless step: it is charged the whole host budget and cannot share a lane.
+
 Rules. An unknown class is refused (fail closed). `--mem-gib`, `--cpus` and `--bytes` may raise an estimate and are refused when
 below the class default; with no class they are recorded as given. `min jobs` is read only by the shadow budget's AMBER report. The exclusion key is resolved without executing anything: `CARGO_TARGET_DIR`, else `build.target-dir` in
 `~/.cargo/config.toml` (one small file read), else `./target`, recorded as `cargo-target:<normalised path>`.
