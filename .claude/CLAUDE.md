@@ -257,7 +257,7 @@ read existing merge-specific wording through the canonical contract above.
 
 Before heavy work run `scripts/memory-admission.py check --weight heavy` from the coding-agent-environment checkout (it also asks the
 SPE-109 disk gate; it is not installed into `~/.claude`); run only the
-heavy lanes the scheduler grants (up to two in the stable and wide disk tiers, a third in the wide tier only as the monitored SPE-160 pilot, never a fourth; ADR 0017), never kill or delete another session's work, and treat a swap-used number as history, not current
+heavy lanes the scheduler grants (the cap `heavy_lane_cap` in `scripts/disk-admission.py` computes for the current disk tier: two lanes in the stable tier, up to four in the wide tier when every lane-3 and lane-4 margin and the resource budget pass, as the monitored pilot of ADR 0017 revisions 11-14; never above that cap), never kill or delete another session's work, and treat a swap-used number as history, not current
 exhaustion. After a reboot treat earlier processes, locks, reservations and jobs as stale and reconcile before resuming.
 Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate.
 
