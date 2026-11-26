@@ -47,14 +47,24 @@ NATIVE_GATE = {"pytest", "py.test", "mypy", "pyright", "tox", "nox", "pip-audit"
 NODE_HEAVY = {"test", "build", "ci", "install", "i", "e2e", "typecheck", "compile"}
 GO_HEAVY = {"build", "test", "vet", "install"}
 MAKE_HEAVY = {"test", "build", "all", "check", "ci", "docker"}
-GIT_LIGHT = {"status", "diff", "log", "show", "rev-parse", "ls-files", "ls-remote", "describe", "blame", "cat-file", "rev-list", "for-each-ref", "fetch", "add"}
+GIT_LIGHT = {"status", "diff", "log", "show", "rev-parse", "ls-files", "describe", "blame", "cat-file", "rev-list", "for-each-ref"}
+# git accepts unambiguous abbreviations of long options (`--upload-p=PROG` runs PROG), so a deny-list cannot work: only these exact
+# read-only flags (and the `--name=value` forms below) keep a git step light; any other `-`/`--` token makes it unknown.
+GIT_SAFE_FLAGS = {"--stat", "--numstat", "--shortstat", "--name-only", "--name-status", "--check", "--cached", "--staged", "--oneline", "--graph",
+                  "--decorate", "--no-color", "--abbrev-commit", "--patch", "-p", "--no-patch", "-s", "-n", "-w", "--quiet", "--exit-code", "--all",
+                  "--first-parent", "--merges", "--no-merges", "--reverse", "--follow", "--no-pager", "--short", "--branch", "-b", "--porcelain",
+                  "--ignored", "-uno", "-unormal", "-uall", "--show-toplevel", "--git-dir", "--abbrev-ref", "--verify", "--is-inside-work-tree",
+                  "--no-ext-diff", "--no-textconv", "--", "--tags", "--long", "--always", "--dirty"}
+GIT_SAFE_VALUE_PREFIXES = ("--format=", "--pretty=", "--max-count=", "--since=", "--until=", "--author=", "--grep=", "--diff-filter=", "--abbrev=",
+                           "--porcelain=", "--git-dir=", "-U", "--unified=", "--relative=")
 GIT_GLOBAL_WITH_VALUE = {"-C", "--git-dir", "--work-tree", "--namespace"}
-GIT_PROGRAM_OPTIONS = ("-c", "--config-env", "--exec", "--upload-pack", "--receive-pack", "--ext-diff", "--textconv", "--exec-path", "--ssh-command")
+TRUSTED_BIN_DIRS = {"/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin", os.path.expanduser("~/.cargo/bin"), os.path.expanduser("~/.local/bin")}
+RECORDER_FLAGS = {"--repo", "--pr", "--base", "--worktree", "--expect-head", "--evidence-host"}   # `--config` (another trust file) is not allowed
 GH_LIGHT = {"pr": {"view", "list", "checks", "diff", "status"}, "issue": {"view", "list", "status"}, "run": {"view", "list"},
             "repo": {"view"}, "release": {"view", "list"}, "workflow": {"view", "list"}, "auth": {"status"}, "label": {"list"},
             "gist": {"view"}, "search": None, "status": None, "api": None}          # None = any arguments; never checkout/create/clone/extension/alias
 # Read/inspect/format/lint tools that do no build and start no program, minus the flags that make them execute one.
-LIGHT_BINARIES = {"jq": (), "yq": (), "grep": (), "rg": ("--pre",), "ls": (), "cat": (), "head": (), "tail": (), "uniq": (), "wc": (), "diff": (),
+LIGHT_BINARIES = {"jq": (), "yq": (), "grep": (), "rg": ("--pre", "--pre-glob", "--hostname-bin"), "ls": (), "cat": (), "head": (), "tail": (), "uniq": (), "wc": (), "diff": (),
                   "echo": (), "printf": (), "test": (), "true": (), "false": (), "sleep": (), "mkdir": (), "cp": (), "mv": (), "touch": (),
                   "stat": (), "date": (), "basename": (), "dirname": (), "tr": (), "cut": (), "ruff": (), "black": (), "isort": (),
                   "shellcheck": (), "yamllint": (), "codespell": (), "gitleaks": (), "actionlint": ("-shellcheck", "-pyflakes"),
@@ -156,28 +166,65 @@ def _cargo(args):
     return _result(BUILD_WORKSPACE, f"cargo {sub} without a package selector builds the whole workspace")
 
 
-def _trusted_checks(argv, trust_file):
-    flags = {argv[i]: argv[i + 1] for i in range(len(argv) - 1) if argv[i].startswith("--")}
+def _trusted_checks(repo, trust_file):
     try:
         with open(trust_file) as handle:
-            checks = json.load(handle)["repos"][flags.get("--repo")]["checks"]
+            checks = json.load(handle)["repos"][repo]["checks"]
         return [c["argv"] for c in checks if isinstance(c, dict) and isinstance(c.get("argv"), list)]
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
-def _git(args, tokens):
-    if any(a == opt or a.startswith(opt + "=") for a in tokens for opt in GIT_PROGRAM_OPTIONS):
-        return _unknown("git option that executes a program")
+def _git(args):
     i = 0
     while i < len(args) and args[i].startswith("-"):
-        i += 2 if args[i] in GIT_GLOBAL_WITH_VALUE else 1
+        if args[i] in ("-C", "--git-dir", "--work-tree", "--namespace") and i + 1 < len(args):
+            i += 2
+        elif args[i] == "--no-pager":
+            i += 1
+        else:
+            return _unknown("git global option not in the read-only list")
     sub = args[i] if i < len(args) else ""
-    return _result(LIGHT, f"git {sub} is read-only and runs no hook") if sub in GIT_LIGHT else _unknown(f"git {sub or '(none)'} may run hooks or commands")
+    if sub not in GIT_LIGHT:
+        return _unknown(f"git {sub or '(none)'} may run hooks or commands")
+    for tok in args[i + 1:]:
+        if tok.startswith("-") and tok not in GIT_SAFE_FLAGS and not tok.startswith(GIT_SAFE_VALUE_PREFIXES) and not tok[1:].isdigit():
+            return _unknown("git option not in the read-only list (git accepts abbreviated long options that execute programs)")
+    return _result(LIGHT, f"git {sub} is read-only and runs no hook")
+
+
+def _denied(tok, denylist):
+    """A program-executing option, with one or two dashes (Go flags take both), `=value`, or an attached short value (`-rx.js`)."""
+    if not tok.startswith("-"):
+        return False
+    name = tok.split("=", 1)[0].lstrip("-")
+    for entry in denylist:
+        bare = entry.lstrip("-")
+        if name == bare or (len(entry) == 2 and tok.startswith(entry) and not tok.startswith("--")):
+            return True
+    return False
+
+
+def _recorder_repo(args):
+    """The repo of an exactly-formed `record --repo X --pr N --base B --worktree W [--expect-head H] [--evidence-host H]`, else None.
+    The script's argparse takes abbreviations, `=` forms and the last duplicate, so anything but this exact shape is unknown."""
+    if args[:1] != ["record"]:
+        return None
+    seen, rest = {}, args[1:]
+    if len(rest) % 2:
+        return None
+    for i in range(0, len(rest), 2):
+        flag, value = rest[i], rest[i + 1]
+        if flag not in RECORDER_FLAGS or flag in seen or value.startswith("-"):
+            return None
+        seen[flag] = value
+    return seen.get("--repo") if {"--repo", "--pr", "--base", "--worktree"} <= set(seen) else None
 
 
 def _classify_core(tokens, notes, trust_file, depth):
     base, args = os.path.basename(tokens[0]), tokens[1:]
+    if "/" in tokens[0] and tokens[0] != "<module>" and os.path.dirname(tokens[0]) not in TRUSTED_BIN_DIRS:
+        return _unknown(f"{tokens[0]} is a path outside the system tool directories; a repo-local script can share a tool's name")
     if base == "<module>":
         name = args[0]
         if name in NATIVE_GATE:
@@ -187,9 +234,10 @@ def _classify_core(tokens, notes, trust_file, depth):
     if script and os.path.basename(script) == WRAPPER_SCRIPT and _under(script, SCRIPT_DIR):
         if depth:
             return _unknown("nested trust-file wrapper")
-        checks = _trusted_checks(args, trust_file)
+        repo = _recorder_repo(args[1:])
+        checks = _trusted_checks(repo, trust_file) if repo else None
         if not checks:
-            return _unknown("owner-merge-local-ci.py: no pinned checks for this repo in the trust file; declare the class yourself")
+            return _unknown("owner-merge-local-ci.py: not the exact `record --repo ... --pr ... --base ... --worktree ...` form, or no pinned checks for that repo; declare the class yourself")
         parts = [classify(c, trust_file, depth + 1) for c in checks]
         if any(p["weight"] == "unknown" for p in parts):
             return _unknown("a pinned check is not recognised: " + "; ".join(p["reason"] for p in parts if p["weight"] == "unknown")[:200])
@@ -220,14 +268,16 @@ def _classify_core(tokens, notes, trust_file, depth):
         sub = next((a for a in args if not a.startswith("-")), "")
         return _result(BUILD_CRATE, f"make {sub} is a native build/test") if sub in MAKE_HEAVY else _unknown(f"make {sub or '(default)'} is not in the table")
     if base == "git":
-        return _git(args, tokens)
+        return _git(args)
     if base == "gh":
-        words = [a for a in args if not a.startswith("-")]
+        words = [a for a in args[:2] if not a.startswith("-")]     # a flag before the subcommand can swallow it (`gh pr -R view checkout`)
+        if len(words) < len(args[:2]):
+            return _unknown("gh flag before the subcommand")
         allowed = GH_LIGHT.get(words[0] if words else "", False)
         ok = allowed is None or (allowed and len(words) > 1 and words[1] in allowed)
         return _result(LIGHT, f"gh {' '.join(words[:2])} is a GitHub read call") if ok else _unknown(f"gh {' '.join(words[:2]) or '(none)'} is not a known read form")
     if base in LIGHT_BINARIES:
-        if any(a == deny or a.startswith(deny + "=") or a.startswith(deny) and deny.startswith("--") for a in args for deny in LIGHT_BINARIES[base]):
+        if any(_denied(a, LIGHT_BINARIES[base]) for a in args):
             return _unknown(f"{base} option that executes a program")
         return _result(LIGHT, f"{base} is a short read/inspect/format/lint command")
     return _unknown(f"{base} is not recognised (scripts, bash -c and pre-commit hide their work)")
