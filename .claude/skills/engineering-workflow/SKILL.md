@@ -358,7 +358,7 @@ existing SPE-109 disk gate with its reservations and lane caps, and keeps heavy 
 checks (hysteresis). A single swap-used figure is history, not proof of current exhaustion. Thresholds are proposed in
 `docs/RESOURCE-ADMISSION.md` in the coding-agent-environment repository; do not change the disk gate's thresholds.
 
-Run only the heavy lanes the disk-admission scheduler grants: up to two in the stable and wide disk tiers (lane 2 only when the resource budget passes, ADR 0017 revision 2), plus a third in the wide tier only as the monitored SPE-160 pilot (ADR 0017 revision 7); never a fourth. Do not start competing Cargo workspace builds, Docker suites, native QA or full
+Run only the heavy lanes the disk-admission scheduler grants: the cap `heavy_lane_cap` in `scripts/disk-admission.py` computes for the current disk tier: up to three lanes in the stable tier (the third only while its 60 GiB margin passes) (lane 2 only when the resource budget passes, ADR 0017 revision 2), up to four in the wide tier when every lane-3 and lane-4 margin passes, as the monitored pilot (ADR 0017 revisions 7-14); never above that cap. Do not start competing Cargo workspace builds, Docker suites, native QA or full
 E2E, and lower subagent fan-out while pressure is not normal; prefer reusable build artifacts and isolated targets
 within the resource budget. Never kill another active session or delete its worktree, runtime, cache, container,
 reservation or scratch. Clean only regenerable caches and scratch proven idle and owned (owner, process lifetime, open
