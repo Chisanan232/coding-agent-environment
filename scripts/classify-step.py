@@ -240,7 +240,7 @@ def _classify_core(tokens, notes, trust_file, depth):
     if base == "<module>":
         name = args[0]
         if name in NATIVE_GATE:
-            return _result(BUILD_CRATE, f"python -m {name} is a native test/type gate", cargo=False)
+            return _result(BUILD_CRATE, f"python -m {name} is a native test/type gate")
         return _result(LIGHT, f"python -m {name} is a formatter") if name in MODULE_LIGHT else _unknown(f"python -m {name} is not in the table")
     script = args[0] if base.startswith("python") and args and not args[0].startswith("-") else ""
     if script and os.path.basename(script) == WRAPPER_SCRIPT and _under(script, SCRIPT_DIR):
@@ -267,15 +267,15 @@ def _classify_core(tokens, notes, trust_file, depth):
     if base in ("cargo", "cargo-nextest"):
         return _cargo(args if base == "cargo" else ["nextest"] + args)
     if base in NATIVE_GATE:
-        return _result(BUILD_CRATE, f"{base} is a native test/type gate (no docker, no cargo target)", cargo=False)
+        return _result(BUILD_CRATE, f"{base} is a native test/type gate (no docker, no cargo target)")
     if base in ("npm", "pnpm", "yarn", "bun"):
         sub = next((a for a in args if not a.startswith("-") and a not in ("run", "exec")), "")
-        return _result(BUILD_CRATE, f"{base} {sub} is a native build/test", cargo=False) if sub in NODE_HEAVY else _unknown(f"{base} {sub or '(none)'} is not in the table")
+        return _result(BUILD_CRATE, f"{base} {sub} is a native build/test") if sub in NODE_HEAVY else _unknown(f"{base} {sub or '(none)'} is not in the table")
     if base == "go":
         sub = args[0] if args else ""
-        return _result(BUILD_CRATE, f"go {sub} is a native build/test", cargo=False) if sub in GO_HEAVY else _unknown(f"go {sub or '(none)'} is not in the table")
+        return _result(BUILD_CRATE, f"go {sub} is a native build/test") if sub in GO_HEAVY else _unknown(f"go {sub or '(none)'} is not in the table")
     if base == "uv" and args[:1] == ["build"]:
-        return _result(BUILD_CRATE, "uv build compiles a wheel", cargo=False)
+        return _result(BUILD_CRATE, "uv build compiles a wheel")
     if base == "make":
         sub = next((a for a in args if not a.startswith("-")), "")
         return _result(BUILD_CRATE, f"make {sub} is a native build/test") if sub in MAKE_HEAVY else _unknown(f"make {sub or '(default)'} is not in the table")
@@ -371,25 +371,36 @@ def _shell_chain(script, trust_file, depth):
     return top
 
 
+PINNED = re.compile(r"[A-Za-z0-9_.-]+==[0-9][A-Za-z0-9.+!-]*")
+PURE_PYTHON_TOOLS = {"pytest", "py.test", "mypy", "pyright"}
+
+
 def _uvx(args, trust_file, depth):
-    """`uvx [--python V] [--from NAME==VER] [--with NAME==VER]... TOOL ARGS`: a pinned tool run. The tool must be the `--from` package (or
-    no `--from`), so a pinned wheel cannot run a different executable. Classified as the tool itself (pytest and mypy are native gates)."""
+    """`uvx [--python V|ABSPATH] --from NAME==VER [--with NAME==VER]... NAME ARGS`: a pinned tool run. `--from` is required and must name the
+    tool, so `uvx cat` never means /bin/cat and an unpinned package never runs. `--python` is a version or an absolute path in a system
+    tool directory. A pinned pytest/mypy/pyright takes no Cargo-target exclusion (the pinned environment holds no Rust build); any other
+    tool is classified as itself and keeps it."""
     i, source = 0, None
     while i < len(args) and args[i].startswith("-"):
         flag = args[i]
-        if flag in ("--python", "-p") and i + 1 < len(args):
+        value = args[i + 1] if i + 1 < len(args) else ""
+        if flag in ("--python", "-p") and (re.fullmatch(r"3(\.[0-9]+){0,2}", value) or (
+                os.path.isabs(value) and os.path.dirname(value) in TRUSTED_BIN_DIRS | {"/opt/homebrew/opt/python@3.14/bin"})):
             i += 2
-        elif flag == "--from" and i + 1 < len(args) and re.fullmatch(r"[A-Za-z0-9_.-]+==[0-9][A-Za-z0-9.+!-]*", args[i + 1]):
-            source, i = args[i + 1].split("==")[0], i + 2
-        elif flag == "--with" and i + 1 < len(args) and re.fullmatch(r"[A-Za-z0-9_.-]+==[0-9][A-Za-z0-9.+!-]*", args[i + 1]):
+        elif flag == "--from" and PINNED.fullmatch(value):
+            source, i = value.split("==")[0], i + 2
+        elif flag == "--with" and PINNED.fullmatch(value):
             i += 2
         else:
             return _unknown(f"uvx flag {flag} is not a pinned form")
-    if i >= len(args):
-        return _unknown("uvx without a tool")
-    if source is not None and args[i] != source:
+    if i >= len(args) or source is None:
+        return _unknown("uvx needs --from NAME==VERSION (an unpinned package would run unreviewed code)")
+    if args[i] != source:
         return _unknown("uvx tool differs from its --from package")
-    return classify(args[i:], trust_file, depth + 1)
+    inner = classify(args[i:], trust_file, depth + 1)
+    if inner["weight"] == "heavy" and inner["class"] == BUILD_CRATE and args[i] in PURE_PYTHON_TOOLS:
+        inner = dict(inner, cargo=False, reason=inner["reason"] + "; pinned uvx environment")
+    return inner
 
 
 def classify(argv, trust_file=DEFAULT_TRUST, depth=0):

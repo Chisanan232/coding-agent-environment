@@ -291,22 +291,29 @@ def parse(argv):
 
 
 SHELL_BINARIES = {"bash", "sh", "zsh"}
-TARGET_ASSIGN = re.compile(r"""(?m)^[ \t]*(?:export[ \t]+)?(?:[A-Za-z_]+=\S*[ \t]+)*CARGO_TARGET_DIR=("[^"\n]*"|'[^'\n]*'|[^\s;&|]+)""")
-WORKSPACE_CARGO = re.compile(r"(?m)^[^#\n]*\bcargo[ \t]+(?:\+\S+[ \t]+)?(?:build|b|test|t|nextest[ \t]+run|clippy|check|doc)\b[^\n|;&]*[ \t]--(?:workspace|all)\b")
+CMD_START = r"(?:^|[;&|{(]|\bthen\b|\bdo\b)[ \t]*"
+TARGET_ASSIGN = re.compile(r"""(?m)""" + CMD_START + r"""(?:export[ \t]+)?(?:[A-Za-z_]+=\S*[ \t]+)*CARGO_TARGET_DIR=("[^"\n]*"|'[^'\n]*'|[^\s;&|]+)""")
+WORKSPACE_CARGO = re.compile(r"(?m)" + CMD_START + r"(?:[A-Za-z_]+=\S*[ \t]+)*cargo[ \t]+(?:\+\S+[ \t]+)?(?:build|b|test|t|nextest[ \t]+run|clippy|check|doc)\b[^\n|;&]*[ \t]--(?:workspace|all)(?![\w-])")
 WORKSPACE_BYTES = 40 * 2**30
 CLASS_ORDER = {"build-crate": 1, "build-workspace": 2}
 
 
 def _script_text(command):
-    """Text of the script in an exact `bash|sh|zsh SCRIPT [ARGS]` command (no shell flags), else None. Only the top-level file: a script
-    it calls is not followed (the owner declares --cargo-target-dir for those)."""
-    if not command or os.path.basename(command[0]) not in SHELL_BINARIES or len(command) < 2 or command[1].startswith("-"):
+    """Text of the script in an exact `bash|sh|zsh SCRIPT [ARGS]` command, or the inline text of `bash|sh|zsh -c TEXT`, else None. Only
+    the top-level text: a script it calls is not followed (the owner declares --cargo-target-dir for those). Backslash-newline joins."""
+    if not command or os.path.basename(command[0]) not in SHELL_BINARIES or len(command) < 2:
         return None
-    try:
-        with open(command[1], "rb") as handle:
-            return handle.read(256 * 1024).decode("utf-8", "replace")
-    except OSError:
+    if command[1] == "-c":
+        text = command[2] if len(command) > 2 else None
+    elif command[1].startswith("-"):
         return None
+    else:
+        try:
+            with open(command[1], "rb") as handle:
+                text = handle.read(256 * 1024).decode("utf-8", "replace")
+        except OSError:
+            return None
+    return text.replace("\\\n", " ") if text is not None else None
 
 
 def prepare(args, env):
@@ -319,11 +326,11 @@ def prepare(args, env):
     text = _script_text(args.command)
     if text is not None:
         literals = {m.group(1).strip("\"'") for m in TARGET_ASSIGN.finditer(text)}
-        if any("$" in v or "`" in v for v in literals):
+        if any(not os.path.isabs(v) or "$" in v or "`" in v for v in literals):
             if not declared:
-                return ("the script sets CARGO_TARGET_DIR from a variable, so the wrapper cannot tell which target it builds into; pass "
+                return ("the script sets CARGO_TARGET_DIR from a variable, a `~` or a relative path, so the wrapper cannot tell which target it builds into; pass "
                         "--cargo-target-dir DIR (or --no-cargo-target for a job that runs no cargo)")
-            literals = {v for v in literals if "$" not in v and "`" not in v}
+            literals = {v for v in literals if os.path.isabs(v) and "$" not in v and "`" not in v}
         resolved = {os.path.realpath(os.path.abspath(v)) for v in literals}
         if len(resolved) > 1:
             return f"the script sets CARGO_TARGET_DIR to {len(resolved)} different directories; one job uses one target (split it, or declare --cargo-target-dir)"
@@ -337,10 +344,11 @@ def prepare(args, env):
                     f"--bytes >= {WORKSPACE_BYTES}, not {args.workload_class}")
     if declared and args.no_cargo_target:
         return "--cargo-target-dir and --no-cargo-target contradict each other"
-    if declared:
+    if declared and args.cargo_target_dir:
         for flag in ("--target-dir",):
             if flag in args.command or any(a.startswith(flag + "=") for a in args.command):
                 return "the command names its own --target-dir; use --cargo-target-dir for the key instead of both"
+    if declared:
         env["CARGO_TARGET_DIR"] = declared
         env.pop("CARGO_BUILD_TARGET_DIR", None)
     return None
@@ -386,7 +394,7 @@ def main(argv=None, env=None):
                 print(f"heavy-run: --bytes {args.bytes} raised to the {args.workload_class} default {floor} (an estimate can be raised, never lowered).",
                       file=sys.stderr)
                 args.bytes = floor
-            if verdict.get("cargo") is False:
+            if verdict.get("cargo") is False and not args.cargo_target_dir:
                 args.no_cargo_target = True
     error = prepare(args, env)
     if error:
