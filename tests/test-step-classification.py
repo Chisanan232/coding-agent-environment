@@ -118,6 +118,25 @@ class Classifier(unittest.TestCase):
         self.assertEqual(self.kind('rtk', 'git', 'status'), ('light', 'light'))                  # rtk's rewrite of a real light command stays light
         self.assertEqual(self.kind('gh', 'pr', 'view', '3'), ('light', 'light'))
 
+    def test_third_review_light_is_an_allow_list_of_exact_safe_shapes(self):
+        """Round 3 of PR 334: each of these started or hid real work yet came back light under the earlier deny-list design."""
+        not_light = (('python3', '-m', 'test', '-j4'), ('uv', 'run', '--only-group', 'test', 'pytest'), ('uv', 'run', '--refresh-package', 'cat', 'pytest'),
+                     ('uv', 'run', '--unknown-flag', 'ls'), ('docker', '--log-level', 'info', 'run', 'alpine'), ('docker', '-c', 'images', 'run', 'alpine'),
+                     ('docker-compose', '-p', 'logs', 'up'), ('git', 'ls-remote', '--upload-pack=CMD', '.'), ('git', 'fetch', '--upload-pack=./x', '.'),
+                     ('git', 'ls-remote', '--exec=./x', '.'), ('git', '--config-env=core.fsmonitor=V', 'status'),
+                     ('GIT_CONFIG_COUNT=1', 'git', 'status'), ('GIT_SSH=./x', 'git', 'fetch'), ('RUSTFMT=./x', 'cargo', 'fmt'),
+                     ('rg', '--pre', './heavy', 'foo'), ('rg', '--pre=./heavy', 'foo'), ('actionlint', '-shellcheck', './x'), ('markdownlint', '--rules', 'x.js'),
+                     ('cargo', 'build', '-p', '*'), ('cargo', 'build', '--package=*'), ('cargo', 'build', '-p', 'foo*'),
+                     ('gh', 'pr', 'checkout', '3'), ('gh', 'pr', 'create'), ('gh', 'repo', 'clone', 'o/r'),
+                     ('python3', '-X', '/x/local-pip-audit.py', 'heavy.py'))
+        for argv in not_light:
+            self.assertNotEqual(self.kind(*argv)[0], 'light', argv)
+        for argv in (('cargo', 'build', '-p', '*'), ('cargo', 'build', '-p', 'foo*')):
+            self.assertEqual(self.kind(*argv), ('heavy', 'build-workspace'), argv)
+        self.assertEqual(self.kind('uv', 'run', 'ruff', 'check'), ('heavy', 'build-crate'))     # uv run may sync a cold environment first
+        self.assertEqual(self.kind('gh', 'pr', 'view', '3'), ('light', 'light'))
+        self.assertEqual(self.kind('rg', 'foo', 'x'), ('light', 'light'))
+
     def test_only_package_selectors_scope_cargo_to_one_package(self):
         self.assertEqual(self.kind('cargo', 'test', '-p', 'one', '--lib'), ('heavy', 'build-crate'))
         self.assertEqual(self.kind('cargo', 'test', '--package=one'), ('heavy', 'build-crate'))
