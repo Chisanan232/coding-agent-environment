@@ -35,6 +35,7 @@ hr = module_from_spec(spec_from_loader('heavy_run_sc', loader))
 loader.exec_module(hr)
 
 NO_TRUST = '/nonexistent/trust.json'
+RECORDER = str(ROOT / 'scripts' / 'owner-merge-local-ci.py')
 
 
 class Classifier(unittest.TestCase):
@@ -61,7 +62,7 @@ class Classifier(unittest.TestCase):
         self.assertEqual(self.kind('docker', 'ps'), ('light', 'light'))
 
     def test_read_and_lint_commands_are_light(self):
-        for argv in (('gh', 'pr', 'view', '3'), ('git', 'status'), ('ruff', 'check', '.'), ('jq', '.', 'x'), ('claude', '--help')):
+        for argv in (('gh', 'pr', 'view', '3'), ('git', 'status'), ('git', '-C', '/x', 'diff', '--stat'), ('ruff', 'check', '.'), ('jq', '.', 'x'), ('claude', '--help')):
             self.assertEqual(self.kind(*argv)[0], 'light', argv)
 
     def test_an_unrecognised_step_is_unknown_never_light(self):
@@ -76,7 +77,7 @@ class Classifier(unittest.TestCase):
         return handle.name
 
     def test_the_local_ci_recorder_takes_the_heaviest_pinned_check(self):
-        record = ['python3', '/x/owner-merge-local-ci.py', 'record', '--repo', 'o/r', '--pr', '1']
+        record = ['python3', RECORDER, 'record', '--repo', 'o/r', '--pr', '1']
         py = self.trust([['uv', 'run', 'ruff', 'check'], ['uv', 'run', 'pytest'], ['uv', 'build']])
         self.assertEqual(self.kind(*record, trust=py), ('heavy', 'build-crate'))
         rust = self.trust([['cargo', 'fmt'], ['cargo', 'build', '--workspace']])
@@ -87,11 +88,39 @@ class Classifier(unittest.TestCase):
         self.assertEqual(self.kind(*record, trust=docs), ('light', 'light'))
 
     def test_the_recorder_is_unknown_without_pinned_checks_or_with_an_unrecognised_one(self):
-        record = ['python3', '/x/owner-merge-local-ci.py', 'record', '--repo', 'o/r', '--pr', '1']
+        record = ['python3', RECORDER, 'record', '--repo', 'o/r', '--pr', '1']
         self.assertEqual(self.kind(*record, trust=NO_TRUST)[0], 'unknown')
         self.assertEqual(self.kind(*record, trust=self.trust([['pytest'], ['./odd.sh']]))[0], 'unknown')
-        other = ['python3', '/x/owner-merge-local-ci.py', 'record', '--repo', 'other/repo', '--pr', '1']
+        other = ['python3', RECORDER, 'record', '--repo', 'other/repo', '--pr', '1']
         self.assertEqual(self.kind(*other, trust=self.trust([['pytest']]))[0], 'unknown')
+
+    def test_nothing_that_can_run_a_heavy_command_is_ever_light(self):
+        """Review of PR 334: under-charging is the unsafe direction. Each of these hides or starts real work."""
+        heavy = (('cargo', 'test', '--', '--help'), ('cargo', 'run', '--', '--version'), ('docker', 'run', 'img', '--version'),
+                 ('npm', 'test', '--', '-h'), ('mvn', '-V', 'test'), ('cargo', 'test', '--lib'), ('cargo', 'test', '--manifest-path', 'Cargo.toml'),
+                 ('cargo', 'build', '--bin', 'x'), ('cargo', 'test', '--test', 't'))
+        for argv in heavy:
+            self.assertEqual(self.kind(*argv)[0], 'heavy', argv)
+        for argv in (('xargs', 'cargo', 'build'), ('find', '.', '-exec', 'cargo', 'test', '{}', '+'), ('awk', 'BEGIN{system("x")}'),
+                     ('sed', 'e', 'f'), ('git', 'commit', '-m', 'x'), ('git', 'push'), ('git', 'rebase', '--exec', 'cargo test'),
+                     ('git', 'bisect', 'run', 'x'), ('git', 'merge', 'x'), ('git', 'checkout', 'x')):
+            self.assertEqual(self.kind(*argv)[0], 'unknown', argv)
+
+    def test_only_package_selectors_scope_cargo_to_one_package(self):
+        self.assertEqual(self.kind('cargo', 'test', '-p', 'one', '--lib'), ('heavy', 'build-crate'))
+        self.assertEqual(self.kind('cargo', 'test', '--package=one'), ('heavy', 'build-crate'))
+
+    def test_a_lone_help_or_version_flag_is_light_but_not_for_container_or_maven_binaries(self):
+        self.assertEqual(self.kind('cargo', '--version'), ('light', 'light'))
+        self.assertEqual(self.kind('docker', '--version')[0], 'heavy')       # docker has no light table entry for a bare flag
+
+    def test_a_same_named_script_elsewhere_is_not_the_pinned_one(self):
+        elsewhere = ['python3', '/tmp/owner-merge-local-ci.py', 'record', '--repo', 'o/r', '--pr', '1']
+        self.assertEqual(self.kind(*elsewhere, trust=self.trust([['pytest']]))[0], 'unknown')
+        self.assertEqual(self.kind('python3', '/tmp/local-pip-audit.py')[0], 'unknown')
+        self.assertEqual(self.kind('python3', '/tmp/local-agent-python-check.py')[0], 'unknown')
+        pinned = os.path.join(cs.LOCAL_DIR, 'local-pip-audit.py')
+        self.assertEqual(self.kind('python3', pinned), ('light', 'light'))
 
 
 class UnderContention(unittest.TestCase):
