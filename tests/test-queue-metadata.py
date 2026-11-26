@@ -118,6 +118,35 @@ class Scripts(unittest.TestCase):
                                    workload_class='build-crate')
         self.assertIsNone(error)
 
+    def test_all_targets_and_all_features_are_not_a_workspace_build(self):
+        for body in ('cargo clippy -p aa-gateway --all-targets -- -D warnings\n', 'cargo test -p a --all-features\n',
+                     "echo 'cargo test --workspace'\n"):
+            error, _, _ = self.prepare(body, workload_class='build-crate')
+            self.assertIsNone(error, body)
+        for body in ('cargo test --all\n', 'cd r && cargo build --workspace\n', 'cargo build \\\n  --workspace\n'):
+            error, _, _ = self.prepare(body, workload_class='build-crate')
+            self.assertIn('build-workspace', error, body)
+
+    def test_a_tilde_or_relative_target_needs_a_declaration(self):
+        for value in ('~/x', 'target', './t'):
+            error, _, _ = self.prepare(f'export CARGO_TARGET_DIR={value}\n')
+            self.assertIn('--cargo-target-dir', error, value)
+
+    def test_a_bash_c_chain_and_a_chained_export_set_the_key(self):
+        private = self.dir / 'inline'
+        args = args_for(['bash', '-c', f'cd /tmp && export CARGO_TARGET_DIR={private}; cargo test -p a'])
+        env = {}
+        with redirect_stderr(io.StringIO()):
+            self.assertIsNone(hr.prepare(args, env))
+        self.assertEqual(self.key(env), ['cargo-target:' + str(private)])
+        error, env, _ = self.prepare(f'cd /tmp && export CARGO_TARGET_DIR={private}\n')
+        self.assertIsNone(error)
+        self.assertEqual(self.key(env), ['cargo-target:' + str(private)])
+
+    def test_a_declared_directory_beside_a_classifier_verdict_is_not_a_contradiction(self):
+        args = args_for(['/bin/bash', '-c', 'pytest'], cargo_target_dir=str(self.dir / 'd'), workload_class='build-crate')
+        self.assertIsNone(hr.prepare(args, {}))
+
     def test_a_non_script_command_is_left_alone(self):
         args = args_for(['cargo', 'build', '--workspace'], workload_class='build-crate')
         self.assertIsNone(hr.prepare(args, {}))
@@ -161,6 +190,17 @@ class Classification(unittest.TestCase):
                        'uvx --from pytest==9.2.0 ruff check', 'uvx --from pytest pytest', 'uvx --index-url http://x pytest', 'pytest *.py',
                        f'pytest > {home}/../../etc/x', 'bash -c "pytest"', 'cd $HOME && pytest', 'export CARGO_TARGET_DIR=$X; pytest'):
             self.assertEqual(self.verdict(script)['weight'], 'unknown', script)
+
+    def test_uvx_must_be_pinned_and_name_its_own_tool(self):
+        for argv in (['uvx', 'cat', 'x'], ['uvx', 'git', 'status'], ['uvx', 'pytest'], ['uvx', '--python', '/tmp/evil', '--from', 'pytest==9.2.0', 'pytest'],
+                     ['uvx', '--from', 'pytest', 'pytest']):
+            self.assertEqual(cs.classify(['/Users/' + os.path.basename(os.path.expanduser('~')) + '/.local/bin/uvx'] + argv[1:])['weight'], 'unknown', argv)
+
+    def test_only_the_pinned_uvx_gate_drops_the_cargo_exclusion(self):
+        self.assertIsNone(cs.classify(['pytest', '-q']).get('cargo'))
+        self.assertIsNone(cs.classify(['npm', 'test']).get('cargo'))
+        self.assertIsNone(cs.classify(['uv', 'build']).get('cargo'))
+        self.assertIs(cs.classify(['uvx', '--from', 'pytest==9.2.0', 'pytest', '-q']).get('cargo'), False)
 
     def test_a_light_chain_stays_light(self):
         self.assertEqual(self.verdict('cd /tmp && git status')['weight'], 'light')
