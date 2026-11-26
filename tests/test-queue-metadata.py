@@ -143,6 +143,15 @@ class Scripts(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(self.key(env), ['cargo-target:' + str(private)])
 
+    def test_launchers_and_flags_before_the_cargo_subcommand_are_seen(self):
+        for body in ('cargo --locked test --workspace\n', 'env cargo test --workspace\n', 'time cargo build --workspace\n', 'cargo +stable test --workspace\n'):
+            error, _, _ = self.prepare(body, workload_class='build-crate')
+            self.assertIn('build-workspace', error, body)
+
+    def test_a_target_dir_inside_the_script_conflicts_with_a_declaration(self):
+        error, _, _ = self.prepare('cargo test -p a --target-dir /x\n', cargo_target_dir=str(self.dir / 'd'))
+        self.assertIn('--target-dir', error)
+
     def test_a_declared_directory_beside_a_classifier_verdict_is_not_a_contradiction(self):
         args = args_for(['/bin/bash', '-c', 'pytest'], cargo_target_dir=str(self.dir / 'd'), workload_class='build-crate')
         self.assertIsNone(hr.prepare(args, {}))
@@ -201,6 +210,10 @@ class Classification(unittest.TestCase):
         self.assertIsNone(cs.classify(['npm', 'test']).get('cargo'))
         self.assertIsNone(cs.classify(['uv', 'build']).get('cargo'))
         self.assertIs(cs.classify(['uvx', '--from', 'pytest==9.2.0', 'pytest', '-q']).get('cargo'), False)
+
+    def test_a_mid_word_hash_is_not_a_comment(self):
+        for script in ('ls a#b; cargo build', 'ls a#b && cargo test --workspace', 'ls x#; cargo clippy'):
+            self.assertNotEqual(self.verdict(script)['weight'], 'light', script)
 
     def test_a_light_chain_stays_light(self):
         self.assertEqual(self.verdict('cd /tmp && git status')['weight'], 'light')
