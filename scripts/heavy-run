@@ -134,6 +134,8 @@ def admitted(args, env, sleep=time.sleep, clock=time.monotonic):
     declare = ["--label", label, "--bytes", str(args.bytes)]
     if args.workload_class:
         declare += ["--class", args.workload_class]
+    if args.no_cargo_target:
+        declare += ["--no-cargo-target"]
     run_extra = ["--ttl-s", str(args.ttl_s)]
     try:
         rc = subprocess.call(runner_cmd("run", *declare, *run_extra, "--", *job), env=env)
@@ -241,6 +243,17 @@ def _terminate(signum, _frame):
     raise SystemExit(128 + signum)
 
 
+def class_disk_floor(name):
+    """Disk bytes the runner requires at least for a class (its table, loaded from the runner next to this file), or 0 when unknown."""
+    try:
+        spec = spec_from_file_location("disk_admission", RUNNER)
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return int(module.WORKLOAD_CLASSES[name]["disk_gib"]) * 2**30
+    except Exception:
+        return 0
+
+
 def classify_auto(command):
     """The step classifier next to this file (scripts/classify-step.py), loaded fresh so the checkout's own rules apply."""
     from importlib.util import module_from_spec, spec_from_file_location
@@ -258,6 +271,11 @@ def parse(argv):
     parser.add_argument("--bytes", type=int, required=True, help="disk bytes to reserve (at least the class default)")
     parser.add_argument("--ttl-s", type=int, default=4 * 3600)
     parser.add_argument("--max-wait-s", type=int, default=3600)
+    parser.add_argument("--cargo-target-dir", default="", help="the Cargo target directory this job really builds into (a script that exports "
+                        "CARGO_TARGET_DIR itself hides it from the wrapper). Exported to the command and used for the exclusion key: jobs on the "
+                        "same directory exclude each other, jobs on different directories do not")
+    parser.add_argument("--no-cargo-target", action="store_true", help="the job runs no Cargo build (a pure-Python gate): no Cargo-target "
+                        "exclusion; memory, CPU and disk are still charged")
     parser.add_argument("--ticket", default="")
     parser.add_argument("--repo", default="heavy-run")
     parser.add_argument("--harness", choices=("claude", "codex"), default=os.environ.get("HEAVY_RUN_HARNESS", "claude"))
@@ -270,6 +288,70 @@ def parse(argv):
     if not 1 <= args.ttl_s <= 14400:
         parser.error("--ttl-s must be 1..14400 (the runner refuses a longer hold without --max-hold)")
     return args
+
+
+SHELL_BINARIES = {"bash", "sh", "zsh"}
+CMD_START = r"(?:^|[;&|{(]|\bthen\b|\bdo\b)[ \t]*"
+TARGET_ASSIGN = re.compile(r"""(?m)""" + CMD_START + r"""(?:export[ \t]+)?(?:[A-Za-z_]+=\S*[ \t]+)*CARGO_TARGET_DIR=("[^"\n]*"|'[^'\n]*'|[^\s;&|]+)""")
+WORKSPACE_CARGO = re.compile(r"(?m)" + CMD_START + r"(?:(?:env|time|command|nohup)[ \t]+|[A-Za-z_]+=\S*[ \t]+)*cargo[ \t]+(?:(?:\+|-)\S*[ \t]+)*(?:build|b|test|t|nextest[ \t]+run|clippy|check|doc)\b[^\n|;&]*[ \t]--(?:workspace|all)(?![\w-])")
+WORKSPACE_BYTES = 40 * 2**30
+CLASS_ORDER = {"build-crate": 1, "build-workspace": 2}
+
+
+def _script_text(command):
+    """Text of the script in an exact `bash|sh|zsh SCRIPT [ARGS]` command, or the inline text of `bash|sh|zsh -c TEXT`, else None. Only
+    the top-level text: a script it calls is not followed (the owner declares --cargo-target-dir for those). Backslash-newline joins."""
+    if not command or os.path.basename(command[0]) not in SHELL_BINARIES or len(command) < 2:
+        return None
+    if command[1] == "-c":
+        text = command[2] if len(command) > 2 else None
+    elif command[1].startswith("-"):
+        return None
+    else:
+        try:
+            with open(command[1], "rb") as handle:
+                text = handle.read(256 * 1024).decode("utf-8", "replace")
+        except OSError:
+            return None
+    return text.replace("\\\n", " ") if text is not None else None
+
+
+def prepare(args, env):
+    """Make the admission key describe what the command will really use. Returns an error text (exit 64) or None; edits env in place.
+    The runner derives its Cargo-target exclusion key from the environment this wrapper hands it (cargo's own resolution order), which
+    cannot see a variable a script sets inside itself. So: an explicit --cargo-target-dir is exported to the command and the runner;
+    a literal CARGO_TARGET_DIR in the script's own text must agree with it (or, with no declaration, is adopted); a script that builds
+    a whole workspace may not be declared as a single-crate build."""
+    declared = os.path.realpath(os.path.abspath(args.cargo_target_dir)) if args.cargo_target_dir else ""
+    text = _script_text(args.command)
+    if text is not None:
+        literals = {m.group(1).strip("\"'") for m in TARGET_ASSIGN.finditer(text)}
+        if any(not os.path.isabs(v) or "$" in v or "`" in v for v in literals):
+            if not declared:
+                return ("the script sets CARGO_TARGET_DIR from a variable, a `~` or a relative path, so the wrapper cannot tell which target it builds into; pass "
+                        "--cargo-target-dir DIR (or --no-cargo-target for a job that runs no cargo)")
+            literals = {v for v in literals if os.path.isabs(v) and "$" not in v and "`" not in v}
+        resolved = {os.path.realpath(os.path.abspath(v)) for v in literals}
+        if len(resolved) > 1:
+            return f"the script sets CARGO_TARGET_DIR to {len(resolved)} different directories; one job uses one target (split it, or declare --cargo-target-dir)"
+        if resolved and not declared and not args.no_cargo_target:
+            declared = next(iter(resolved))
+            print(f"heavy-run: the script sets CARGO_TARGET_DIR={declared}; using it as the exclusion key.", file=sys.stderr)
+        elif resolved and declared and next(iter(resolved)) != declared:
+            return f"--cargo-target-dir {declared} differs from the CARGO_TARGET_DIR {next(iter(resolved))} the script sets"
+        if (args.workload_class or "") in CLASS_ORDER and CLASS_ORDER[args.workload_class] < 2 and WORKSPACE_CARGO.search(text):
+            return ("the script builds or tests the whole cargo workspace (--workspace/--all): declare --class build-workspace with "
+                    f"--bytes >= {WORKSPACE_BYTES}, not {args.workload_class}")
+    if declared and args.no_cargo_target:
+        return "--cargo-target-dir and --no-cargo-target contradict each other"
+    if declared and args.cargo_target_dir:
+        inline = text if text is not None else ""
+        if any(a == "--target-dir" or a.startswith("--target-dir=") for a in args.command) or re.search(r"--target-dir\b", inline):
+            return "the command or its script names its own --target-dir; use --cargo-target-dir for the key instead of both"
+    if declared:
+        env["CARGO_TARGET_DIR"] = declared
+        env.pop("CARGO_BUILD_TARGET_DIR", None)
+    return None
 
 
 def main(argv=None, env=None):
@@ -288,20 +370,36 @@ def main(argv=None, env=None):
         except OSError as exc:
             print(f"heavy-run: cannot run {args.command[0]}: {exc}", file=sys.stderr)
             return 127
-    if args.workload_class == "auto":
+    if args.workload_class in (None, "auto"):
+        # An omitted class is classified like `--class auto`; only a command the classifier cannot name stays classless (below).
+        omitted = args.workload_class is None
         verdict = classify_auto(args.command)
-        print(f"heavy-run: --class auto: {verdict['weight']} ({verdict['class']}): {verdict['reason']}", file=sys.stderr)
+        print(f"heavy-run: --class {'(omitted) ' if omitted else ''}auto: {verdict['weight']} ({verdict['class']}): {verdict['reason']}", file=sys.stderr)
         if verdict["weight"] == "unknown":
-            print("heavy-run: refusing to guess; declare --class (docs/RESOURCE-ADMISSION.md, step classification) or run a light step directly.",
-                  file=sys.stderr)
-            return 64
-        if verdict["weight"] == "light":
+            if not omitted:
+                print("heavy-run: refusing to guess; declare --class (docs/RESOURCE-ADMISSION.md, step classification) or run a light step directly.",
+                      file=sys.stderr)
+                return 64
+            args.workload_class = None
+        elif verdict["weight"] == "light":
             try:
                 return exit_code(subprocess.call(args.command, env=env))
             except OSError as exc:
                 print(f"heavy-run: cannot run {args.command[0]}: {exc}", file=sys.stderr)
                 return 127
-        args.workload_class = verdict["class"]
+        else:
+            args.workload_class = verdict["class"]
+            floor = class_disk_floor(args.workload_class)
+            if floor and args.bytes < floor:
+                print(f"heavy-run: --bytes {args.bytes} raised to the {args.workload_class} default {floor} (an estimate can be raised, never lowered).",
+                      file=sys.stderr)
+                args.bytes = floor
+            if verdict.get("cargo") is False and not args.cargo_target_dir:
+                args.no_cargo_target = True
+    error = prepare(args, env)
+    if error:
+        print(f"heavy-run: {error}", file=sys.stderr)
+        return 64
     if not args.workload_class:
         print("heavy-run: WARNING no --class: the runner records an unknown workload and charges the host's whole resource budget.",
               file=sys.stderr)

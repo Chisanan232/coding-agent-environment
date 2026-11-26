@@ -251,13 +251,35 @@ A step waits only for a queued step whose result it needs (`heavy-run` returns t
 |---|---|---|
 | `cargo build/test/clippy/check --workspace`, or any cargo step with no package selector | `build-workspace` | |
 | `cargo ... -p crate`, `--lib`, `--bin`, `--test` | `build-crate` | |
-| pytest, mypy, `uv build`, npm/pnpm test or build, `go test`, `make test` | `build-crate` | native gate: no docker, no cargo target, so no exclusion key |
+| pytest, mypy, `uv build`, npm/pnpm test or build, `go test`, `make test` | `build-crate` | native gate: no docker; keeps the cargo-target key because argv alone cannot rule out a Rust build (maturin, tauri, napi) |
+| `uvx --from pytest==X pytest ...` (also mypy, pyright) | `build-crate` | the pinned environment holds no Rust build: `--no-cargo-target`, no exclusion key |
 | `owner-merge-local-ci.py record` | heaviest class among the checks pinned for that repo | a Python repo is `build-crate`; it is not a container suite unless a pinned check runs containers |
 | docker, podman, compose that run containers | `container-suite` | takes the `docker` key, serialising behind real container suites |
 | git, gh, jq, grep/rg, ruff, formatters, docs and link checks, review, ticket work, narrow reads | light | do not queue |
 
 A step that wraps several checks is classified by its heaviest one; split a step whose light parts would otherwise wait behind a
 heavy one. Never submit a classless step: it is charged the whole host budget and cannot share a lane.
+
+What the queue records must describe what the job really does (found 2026-11-26: a `bash script` that exported its own
+`CARGO_TARGET_DIR` was keyed on the shared target, a `cargo build --workspace` script was charged as a single crate, and an omitted
+class left pytest gates charged the whole host):
+
+- `heavy-run` derives the exclusion key from the environment it hands the runner, which cannot see a variable a script sets inside
+  itself. A script (or `bash -c` text) that exports an absolute literal `CARGO_TARGET_DIR` has it adopted; one that sets it from a variable,
+  a `~` or a relative path, or to two different directories, is refused (64). `--cargo-target-dir DIR` declares the directory for any job (scripts that call other scripts included):
+  it is exported to the command and used for the key, so jobs on the same directory exclude each other and jobs on different
+  directories (or the shared target) do not. A `--target-dir` in the command itself is refused together with it.
+- A script (`bash|sh|zsh FILE`) whose own text builds or tests with `--workspace`/`--all` may not be declared `build-crate`; declare
+  `build-workspace` with `--bytes` of at least its default. Only the top-level file is read; a nested script is the owner's declaration.
+- A pinned `uvx --from pytest==X pytest` (or mypy, pyright) run takes `--no-cargo-target` under `--class auto`: memory, CPU and disk are
+  charged, but no exclusion key is taken and the job is not serialised behind cargo jobs. `uvx` without `--from NAME==VERSION` is
+  unknown. Residual risk, accepted: argv cannot show that a pinned `--with` package or a pytest plugin/suite calls cargo; a pure-Python
+  repo is the intended use, and a repo whose tests build Rust must declare `--cargo-target-dir` (which keeps the key). Declare the flag yourself only for a job that cannot invoke cargo.
+- An omitted `--class` is classified like `--class auto` (light runs at once, heavy takes its class and a raised `--bytes`); only a
+  command the classifier cannot name stays classless with the warning. `bash -c 'cd DIR && export PYTHONPATH=...; uvx --from
+  pytest==X pytest ... > LOG 2>&1; echo "exit=$?" >> LOG'` is read in that exact shape; pipes, substitutions and subshells are unknown.
+- The queue has no amend operation: correcting a queued entry means cancelling your own and resubmitting. A resubmitted job whose key
+  no longer clashes with the head is eligible for the bounded backfill at once instead of waiting behind it.
 
 Rules. An unknown class is refused (fail closed). `--mem-gib`, `--cpus` and `--bytes` may raise an estimate and are refused when
 below the class default; with no class they are recorded as given. `min jobs` is read only by the shadow budget's AMBER report. The exclusion key is resolved without executing anything: `CARGO_TARGET_DIR`, else `build.target-dir` in
