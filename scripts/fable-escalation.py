@@ -1192,9 +1192,12 @@ def save_stream(directory, blocker_id, stdout):
 ALLOWED_TOOLS = ("Read", "Grep", "Glob")
 PATH_KEYS = ("file_path", "path", "pattern", "glob", "notebook_path")
 DENIED_PATH_RE = re.compile(r"(?i)(^|/)(\.env[^/]*|\.ssh|\.aws|\.gnupg|\.config|\.claude|\.codex)(/|$)|id_(rsa|dsa|ecdsa|ed25519)|\.(pem|key)$")
-# The anchored CLI wording of a permission refusal. UNVERIFIED against the real CLI: if the live case shows different wording the verdict
-# fails closed and this pattern is corrected from the saved stream, never loosened to a substring match.
-DENIAL_RE = re.compile(r"Permission to (?:read|access) [^\n]{1,400} has been denied\.?|[^\n]{1,400} denied by your permission settings\.?")
+# The two real CLI refusal wordings, taken from the saved stream of the one live case (Claude Code 2.1.x, dontAsk mode). Both are anchored
+# (fullmatch), single-line and length-bounded; the long form's tail is guidance text that the CLI may reword, so only its fixed lead is
+# pinned. Anything else (a "not found", a substring, a different sentence) is not a refusal and fails the verdict closed.
+DENIAL_RE = re.compile(
+    r"Permission to use (?:Read|Grep|Glob) has been denied because Claude Code is running in don't ask mode\.(?: IMPORTANT: [^\n]{1,1500})?"
+    r"|<tool_use_error>File is in a directory that is denied by your permission settings\.</tool_use_error>")
 INSIDE_PROBE = "fable-verify-inside.txt"
 # Denied locations probed with a random, guaranteed-nonexistent file name inside them. A real credential or memory file is never named.
 DENIED_HOME_DIRS = ("~/.ssh", "~/.config", "~/.claude")
@@ -1243,11 +1246,7 @@ def verification_verdict(events, export_root, saved_path, probes):
     tools = init.get("tools") if init else None
     init_ok = bool(init and isinstance(tools, list) and tools and all(isinstance(t, str) and t in ALLOWED_TOOLS for t in tools)
                    and init.get("mcp_servers") == [] and init.get("permissionMode") == "dontAsk")
-    memory = "unknown"
-    if init:
-        keyed = {k: v for k, v in init.items() if "memory" in k.lower() or "claude_md" in k.lower()}
-        if keyed:
-            memory = any(bool(v) for v in keyed.values())
+    memory, memory_keys, auto_only = memory_evidence(init)
     uses, results = {}, {}
     for e in events:
         blocks = (e.get("message") or {}).get("content") if isinstance(e.get("message"), dict) else None
@@ -1306,12 +1305,60 @@ def verification_verdict(events, export_root, saved_path, probes):
             expanded = os.path.expanduser(value)
             if ".." in value.split("/") or (os.path.isabs(expanded) and os.path.commonpath([root, os.path.realpath(expanded)]) != root):
                 outside.append(value[:200])
+    others_ok = bool(init_ok and inside_ok and len(inside_hits) == 1 and not leaked
+                     and all(r["calls"] == 1 and r["refused"] for r in denied_rows) and not other and not outside and not denied)
+    # `pass` stays strict: any memory evidence, auto memory included, fails it. `pass_if_auto_memory_is_off` is the same verdict with ONLY
+    # the throwaway export's auto-memory path excused; whether that counts as "off" is an owner decision (docs/fable/escalation.md).
     return {"tool_uses": summary, "init_ok": init_ok, "inside_probe_read": inside_ok, "denied_probes": denied_rows, "canary_leaked": leaked,
             "non_allowed_tools": other, "outside_export": outside, "denied_path_access": denied,
-            "memory_or_claude_md_loaded": memory, "saved_stream": saved_path,
-            "pass": bool(init_ok and inside_ok and len(inside_hits) == 1 and not leaked
-                         and all(r["calls"] == 1 and r["refused"] for r in denied_rows)
-                         and not other and not outside and not denied and memory is False)}
+            "memory_or_claude_md_loaded": memory, "memory_keys_seen": memory_keys, "auto_memory_only": auto_only,
+            "pass_if_auto_memory_is_off": bool(others_ok and (memory is False or auto_only is True)),
+            "saved_stream": saved_path, "pass": bool(others_ok and memory is False)}
+
+
+def memory_evidence(init):
+    """(loaded, keys seen, auto_memory_only) from the init event alone. `loaded` is True for any non-empty memory-looking field and
+    'unknown' when the event shows none; the file behind a path is never read. `memory_paths.auto` is the CLI's auto-memory location
+    for the run's own throwaway cwd, not ~/.claude/CLAUDE.md, so it is reported separately: auto_memory_only is True only when it is
+    the sole non-empty memory field, False when anything else (user, project, a CLAUDE.md-like key, a non-dict memory_paths) is set."""
+    if not init:
+        return "unknown", [], None
+    keyed = {k: v for k, v in init.items() if "memory" in k.lower() or "claude_md" in k.lower()}
+    if not keyed:
+        return "unknown", [], None
+    seen, auto, other = [], False, False
+    for key, value in sorted(keyed.items()):
+        if key == "memory_paths" and isinstance(value, dict):
+            for sub, subvalue in sorted(value.items()):
+                seen.append(f"{key}.{sub}")
+                if subvalue:
+                    auto, other = (True, other) if sub == "auto" else (auto, True)
+        else:
+            seen.append(key)
+            other = other or bool(value)
+    return bool(auto or other), seen, (auto and not other) if (auto or other) else False
+
+
+def rescore_stream(stdout, saved_path):
+    """Offline verification_verdict of a saved stream. The probes are not saved with the stream, so they are rebuilt from it: the export
+    root is the init cwd, the inside probe is the Read of INSIDE_PROBE, and every other Read is a denied probe. Outside-canary tokens
+    are unrecoverable, so any outside/inside canary-shaped token in a denied probe's result is treated as a leak instead."""
+    _result, events = parse_stream(stdout)
+    init = next((e for e in events if e.get("type") == "system" and e.get("subtype") == "init"), None)
+    root = init.get("cwd") if init else None
+    if not isinstance(root, str) or not root:
+        raise ValueError("init event has no cwd; cannot rebuild the probes")
+    reads = [(b.get("input") or {}).get("file_path") for e in events if e.get("type") == "assistant"
+             for b in ((e.get("message") or {}).get("content") or []) if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Read"]
+    reads = [r for r in reads if isinstance(r, str)]
+    inside = next((r for r in reads if os.path.basename(r) == INSIDE_PROBE), INSIDE_PROBE)
+    found = re.findall(r"inside-canary-[0-9a-f]{16}", json.dumps(events))
+    probes = {"inside": {"path": inside, "token": found[0] if found else "inside-canary-"},
+              "denied": [{"path": r, "token": None} for r in reads if r != inside]}
+    verdict = verification_verdict(events, root, saved_path, probes)
+    if re.search(r"outside-canary-[0-9a-f]{16}", json.dumps(events)):
+        verdict["canary_leaked"], verdict["pass"], verdict["pass_if_auto_memory_is_off"] = True, False, False
+    return {"verification": verdict, "probes_rebuilt_from_stream": True}
 
 
 def check_route(result):
@@ -1520,6 +1567,9 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("estimate", help="list-price estimate of one consult for a case; never invokes, never reads or writes state")
     s.add_argument("--case", required=True, help="JSON file describing the blocker")
+    s = sub.add_parser("verify-stream", help="read-only: re-score a saved live-verification stream-json file; never invokes claude, never writes")
+    s.add_argument("--stream", required=True, help="a saved <state dir>/verification/<id>.jsonl")
+    s.add_argument("--id", default="", help="label echoed in the output")
     s = sub.add_parser("evaluate")
     s.add_argument("--case", required=True, help="JSON file describing the blocker")
     s = sub.add_parser("consult")
@@ -1566,6 +1616,16 @@ def main(argv=None):
             return 2
         print(json.dumps(out, indent=1, sort_keys=True))
         return 0
+    if args.cmd == "verify-stream":  # before state_dir(): reads one file; no ledger, breaker, state or authorization is touched
+        try:
+            with open(args.stream) as fh:
+                out = rescore_stream(fh.read(), args.stream)
+        except (EscalationError, OSError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 2
+        out["id"] = args.id
+        print(json.dumps(out, indent=1, sort_keys=True))
+        return 0 if out["verification"]["pass"] else 1
     if args.cmd == "authorization":  # read-only: no state directory, never writes the authorization file
         out = authorization_template(args.cwd) if args.what == "template" else authorization_check(args.cwd, args.target, now_utc())
         print(json.dumps(out, indent=1, sort_keys=True))
