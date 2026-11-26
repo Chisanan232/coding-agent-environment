@@ -8,11 +8,12 @@ shared, deterministic answer to "which one is this step?", so that sessions stop
 
 weight  light   -> run the step now, directly, outside any lane; never wait behind a queued step for it
         heavy   -> `heavy-run --class <class> ...` (or `--class auto`); the step waits only for a lane
-        unknown -> the command is not recognised; read the class table in docs/RESOURCE-ADMISSION.md and declare a class yourself
+        unknown -> not recognised; read the class table in docs/RESOURCE-ADMISSION.md and declare a class yourself
 
-It never guesses: an unrecognised command is `unknown`, not light. A wrapper that hides its work (`owner-merge-local-ci.py record`) is
-classified by the checks the owner's trust file pins for that repo, and the heaviest check wins. The tool reads nothing else, runs
-nothing and writes nothing.
+The failure direction that matters is UNDER-charging (heavy work called light), so light is an allow-list of exact, known-safe shapes:
+every other command, flag or wrapper form is `unknown` or heavy, never light. It never guesses and never executes anything. A wrapper
+that hides its work (`owner-merge-local-ci.py record`) is classified by the checks the owner's pinned trust file lists for that repo,
+and the heaviest check wins. The tool reads nothing else and writes nothing.
 """
 import argparse
 import json
@@ -23,72 +24,48 @@ LIGHT, BUILD_CRATE, BUILD_WORKSPACE, CONTAINER = "light", "build-crate", "build-
 ORDER = {LIGHT: 0, BUILD_CRATE: 1, BUILD_WORKSPACE: 2, CONTAINER: 3}
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 LOCAL_DIR = os.path.expanduser("~/.config/coding-agent-environment/local")
-DEFAULT_TRUST = os.path.expanduser("~/.config/coding-agent-environment/local/local-first-ci.json")
-
-# git runs hooks (pre-commit, pre-push, post-checkout) and `rebase --exec` / `bisect run` run commands, so only these never do.
-GIT_LIGHT = {"status", "diff", "log", "show", "rev-parse", "ls-files", "ls-remote", "describe", "blame", "cat-file", "rev-list", "for-each-ref", "fetch", "add"}
-GIT_GLOBAL_WITH_VALUE = {"-C", "--git-dir", "--work-tree", "--namespace"}
-GIT_RUNS_PROGRAMS = {"-c", "--ext-diff", "--textconv", "--exec-path", "--upload-pack", "--receive-pack"}   # config/flags that execute a named program
-GH_LIGHT = {"pr", "issue", "run", "repo", "release", "workflow", "auth", "search", "status", "api", "label", "gist"}   # not extension/alias/codespace
-ENV_RUNS_PROGRAMS = {"GIT_EXTERNAL_DIFF", "GIT_SSH_COMMAND", "GIT_PAGER", "PAGER", "EDITOR", "VISUAL", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "SHELL", "BASH_ENV", "ENV"}
-RTK_WRAPS = {"test", "err"}
-PASS_THROUGH = {"rtk", "env", "time", "nice", "command", "exec", "nohup"}
-UV_FLAGS_WITH_VALUE = {"--config-file", "--cache-dir", "--with-editable", "-w", "--index-strategy", "--link-mode", "--no-install-package", "--keyring-provider", "--python-preference", "--color", "--allow-insecure-host", "--find-links", "-f", "--constraints", "-c", "--overrides", "--exclude-newer", "--no-binary-package", "--no-build-package", "--no-binary", "--index", "--index-url", "--default-index", "--resolution", "--prerelease", "--package", "--reinstall-package", "--upgrade-package", "--with", "--extra", "--group", "--python", "-p", "--project", "--directory", "--env-file", "--with-requirements"}
-CARGO_LIGHT = {"fmt", "metadata", "tree", "locate-project", "audit", "deny", "search", "version", "--version", "-V", "help"}
-CARGO_HEAVY = {"build", "b", "test", "t", "nextest", "clippy", "check", "c", "bench", "doc", "run", "r", "llvm-cov", "tarpaulin", "miri", "install"}
-CARGO_PACKAGE_SELECTORS = {"-p", "--package"}   # --lib/--bin/--test/--manifest-path still compile every member at a virtual-workspace root
-DOCKER_LIGHT = {"ps", "inspect", "version", "info", "logs", "images", "ls", "stats", "context", "port"}
-DOCKER_BINARIES = {"docker", "podman", "nerdctl", "docker-compose", "podman-compose"}
-NATIVE_GATE = {"pytest", "py.test", "mypy", "pyright", "tox", "nox", "pip-audit", "pip_audit", "coverage", "tsc", "vitest", "jest", "mvn", "gradle", "gradlew"}
-NODE_HEAVY = {"test", "build", "ci", "install", "i", "e2e", "lint:ci", "typecheck", "compile"}
-GO_HEAVY = {"build", "test", "vet", "install"}
-MAKE_HEAVY = {"test", "build", "all", "check", "ci", "docker"}
-LIGHT_BINARIES = {"jq", "yq", "grep", "rg", "ls", "cat", "head", "tail", "uniq", "wc", "diff", "echo",
-                  "printf", "test", "true", "false", "sleep", "mkdir", "cp", "mv", "touch", "stat", "date", "basename", "dirname", "tr", "cut",
-                  "ruff", "black", "isort", "shellcheck", "yamllint", "markdownlint", "codespell", "gitleaks", "actionlint", "curl", "shasum",
-                  "sha256sum", "readlink", "realpath", "wait", "tee"}
+DEFAULT_TRUST = os.path.join(LOCAL_DIR, "local-first-ci.json")
 WRAPPER_SCRIPT = "owner-merge-local-ci.py"
 PINNED_SCRIPTS = {"local-pip-audit.py": (LIGHT, "owner-pinned short dependency audit"),
                   "local-agent-python-check.py": (BUILD_CRATE, "owner-pinned Python journey test suite")}
 
+PASS_THROUGH = {"env", "time", "command", "exec", "nohup"}                 # bare launchers; a flag or value after them is unknown
+UV_BOOL_FLAGS = {"--locked", "--frozen", "--no-sync", "--isolated", "--no-project", "--all-extras", "--no-build", "--no-dev", "--no-editable",
+                 "--offline", "--quiet", "-q", "--verbose", "-v", "--exact", "--no-cache", "--active", "--all-packages", "--no-env-file",
+                 "--reinstall", "--refresh", "--upgrade", "-U", "--native-tls", "--no-config", "--all-groups", "--no-default-groups", "--no-binary"}
+UV_VALUE_FLAGS = {"--with", "--with-editable", "--with-requirements", "--extra", "--group", "--only-group", "--no-group", "--python", "-p",
+                  "--project", "--directory", "--env-file", "--no-binary-package", "--no-build-package", "--index", "--index-url",
+                  "--default-index", "--resolution", "--prerelease", "--package", "--reinstall-package", "--upgrade-package",
+                  "--refresh-package", "--no-install-package", "--config-file", "--cache-dir", "-w", "--index-strategy", "--link-mode",
+                  "--keyring-provider", "--python-preference", "--color", "--find-links", "-f", "--constraints", "-c", "--overrides",
+                  "--exclude-newer", "--exclude-newer-package", "--config-setting", "-C", "--python-platform", "--python-version"}
+CARGO_LIGHT = {"fmt", "metadata", "tree", "locate-project", "audit", "deny", "search", "version", "--version", "-V", "help"}
+CARGO_HEAVY = {"build", "b", "test", "t", "nextest", "clippy", "check", "c", "bench", "doc", "run", "r", "llvm-cov", "tarpaulin", "miri", "install"}
+DOCKER_LIGHT = {"ps", "inspect", "version", "info", "logs", "images", "ls", "stats", "port"}   # only as the FIRST argument, no global flag before
+DOCKER_BINARIES = {"docker", "podman", "nerdctl", "docker-compose", "podman-compose"}
+NATIVE_GATE = {"pytest", "py.test", "mypy", "pyright", "tox", "nox", "pip-audit", "pip_audit", "coverage", "tsc", "vitest", "jest", "mvn", "gradle", "gradlew"}
+NODE_HEAVY = {"test", "build", "ci", "install", "i", "e2e", "typecheck", "compile"}
+GO_HEAVY = {"build", "test", "vet", "install"}
+MAKE_HEAVY = {"test", "build", "all", "check", "ci", "docker"}
+GIT_LIGHT = {"status", "diff", "log", "show", "rev-parse", "ls-files", "ls-remote", "describe", "blame", "cat-file", "rev-list", "for-each-ref", "fetch", "add"}
+GIT_GLOBAL_WITH_VALUE = {"-C", "--git-dir", "--work-tree", "--namespace"}
+GIT_PROGRAM_OPTIONS = ("-c", "--config-env", "--exec", "--upload-pack", "--receive-pack", "--ext-diff", "--textconv", "--exec-path", "--ssh-command")
+GH_LIGHT = {"pr": {"view", "list", "checks", "diff", "status"}, "issue": {"view", "list", "status"}, "run": {"view", "list"},
+            "repo": {"view"}, "release": {"view", "list"}, "workflow": {"view", "list"}, "auth": {"status"}, "label": {"list"},
+            "gist": {"view"}, "search": None, "status": None, "api": None}          # None = any arguments; never checkout/create/clone/extension/alias
+# Read/inspect/format/lint tools that do no build and start no program, minus the flags that make them execute one.
+LIGHT_BINARIES = {"jq": (), "yq": (), "grep": (), "rg": ("--pre",), "ls": (), "cat": (), "head": (), "tail": (), "uniq": (), "wc": (), "diff": (),
+                  "echo": (), "printf": (), "test": (), "true": (), "false": (), "sleep": (), "mkdir": (), "cp": (), "mv": (), "touch": (),
+                  "stat": (), "date": (), "basename": (), "dirname": (), "tr": (), "cut": (), "ruff": (), "black": (), "isort": (),
+                  "shellcheck": (), "yamllint": (), "codespell": (), "gitleaks": (), "actionlint": ("-shellcheck", "-pyflakes"),
+                  "markdownlint": ("--rules", "-r", "--custom-rules"), "shasum": (), "sha256sum": (), "readlink": (), "realpath": (),
+                  "wait": (), "tee": ()}
+MODULE_LIGHT = {"json.tool", "ruff", "black", "isort"}
+HELP_FLAGS = ("--help", "-h", "--version", "-V")
+
 
 def _is_assignment(token):
     return "=" in token and not token.startswith("-") and token.split("=", 1)[0].replace("_", "").isalnum()
-
-
-def _under(path, directory):
-    """True when `path` resolves to a file directly inside `directory` (a same-named script elsewhere is not the pinned one)."""
-    return os.path.dirname(os.path.realpath(path)) == os.path.realpath(directory)
-
-
-def strip_wrappers(argv):
-    """Drop env assignments and transparent launchers (rtk, env, timeout N, nice, uv run [flags], python -m) down to the real command."""
-    tokens = [t for t in argv if isinstance(t, str)]
-    changed = True
-    while tokens and changed:
-        changed = False
-        base = os.path.basename(tokens[0])
-        if _is_assignment(tokens[0]):
-            if tokens[0].split("=", 1)[0] in ENV_RUNS_PROGRAMS:
-                return ["<env-program>"]
-            tokens, changed = tokens[1:], True
-        elif base == "rtk" and len(tokens) > 1 and tokens[1] in RTK_WRAPS:
-            tokens, changed = tokens[2:], True      # `rtk test CMD` / `rtk err CMD` run CMD; `test` is not coreutils test here
-        elif base in PASS_THROUGH:
-            tokens, changed = tokens[1:], True
-        elif base == "timeout":
-            rest = tokens[1:]
-            while rest and rest[0].startswith("-"):
-                rest = rest[1:]
-            tokens, changed = rest[1:] if rest else [], True
-        elif base == "uv" and len(tokens) > 1 and tokens[1] == "run":
-            rest, i = tokens[2:], 0
-            while i < len(rest) and rest[i].startswith("-"):
-                i += 2 if rest[i] in UV_FLAGS_WITH_VALUE else 1
-            tokens, changed = rest[i:], True
-        elif base.startswith("python") and len(tokens) > 2 and tokens[1] == "-m":
-            tokens, changed = tokens[2:], True
-    return tokens
 
 
 def _result(klass, reason):
@@ -99,70 +76,140 @@ def _unknown(reason):
     return {"weight": "unknown", "class": None, "reason": reason}
 
 
+def _under(path, directory):
+    """True when `path` resolves to a file directly inside `directory` (a same-named script elsewhere is not the pinned one)."""
+    return os.path.dirname(os.path.realpath(path)) == os.path.realpath(directory)
+
+
+def peel(argv):
+    """Strip transparent launchers down to the real command. Returns (tokens, notes); notes say which wrappers were crossed.
+    An env assignment, a flag after a bare launcher, an unknown uv flag or a `rtk`/`timeout` form this does not model makes the
+    result `["<?>"]`: the caller reports unknown rather than misreading a value as the command."""
+    tokens, notes = [t for t in argv if isinstance(t, str)], set()
+    while tokens:
+        base = os.path.basename(tokens[0])
+        if _is_assignment(tokens[0]):
+            notes.add("env")
+            tokens = tokens[1:]
+        elif base == "rtk" and len(tokens) > 1 and tokens[1] in ("test", "err"):
+            tokens = tokens[2:]                       # `rtk test CMD` / `rtk err CMD` run CMD; this `test` is not coreutils test
+        elif base == "rtk":
+            tokens = tokens[1:]
+            if tokens and tokens[0] in ("proxy", "gain", "discover", "summary", "init", "config"):
+                return ["<?>"], notes
+        elif base in PASS_THROUGH:
+            tokens = tokens[1:]
+            if tokens and tokens[0].startswith("-"):
+                return ["<?>"], notes
+        elif base == "timeout":
+            rest = tokens[1:]
+            if not rest or rest[0].startswith("-") or not rest[0].rstrip("smhd").replace(".", "").isdigit():
+                return ["<?>"], notes
+            tokens = rest[1:]
+        elif base == "uv" and len(tokens) > 1 and tokens[1] == "run":
+            rest, i = tokens[2:], 0
+            while i < len(rest) and rest[i].startswith("-"):
+                flag = rest[i].split("=", 1)[0]
+                if flag in UV_VALUE_FLAGS:
+                    i += 1 if "=" in rest[i] else 2
+                elif flag in UV_BOOL_FLAGS:
+                    i += 1
+                else:
+                    return ["<?>"], notes
+            notes.add("uv")
+            tokens = rest[i:]
+        elif base.startswith("python") and len(tokens) > 2 and tokens[1] == "-m":
+            notes.add("module")
+            return ["<module>", tokens[2]] + tokens[3:], notes
+        else:
+            break
+    return tokens, notes
+
+
+def _packages(args):
+    """Package selectors before `--` (after it the flags belong to the test binary): list of values."""
+    own, values, i = (args[:args.index("--")] if "--" in args else args), [], 0
+    while i < len(own):
+        if own[i] in ("-p", "--package") and i + 1 < len(own):
+            values.append(own[i + 1])
+            i += 2
+            continue
+        if own[i].startswith("--package="):
+            values.append(own[i].split("=", 1)[1])
+        i += 1
+    return values
+
+
 def _cargo(args):
     sub = next((a for a in args if not a.startswith("+") and not (a.startswith("-") and a not in ("--version", "-V"))), "")
     if sub in CARGO_LIGHT:
         return _result(LIGHT, f"cargo {sub} does not compile the workspace")
-    if sub in CARGO_HEAVY:
-        if "--workspace" in args or "--all" in args:
-            return _result(BUILD_WORKSPACE, f"cargo {sub} --workspace compiles every member")
-        own = args[:args.index("--")] if "--" in args else args      # after `--` the flags belong to the test binary
-        packages = [a for a in own if a in CARGO_PACKAGE_SELECTORS or a.startswith("--package=")]
-        if len(packages) == 1:
-            return _result(BUILD_CRATE, f"cargo {sub} is scoped to one package")
-        if len(packages) > 1:
-            return _result(BUILD_WORKSPACE, f"cargo {sub} names {len(packages)} packages; charged as the workspace")
-        return _result(BUILD_WORKSPACE, f"cargo {sub} without a package selector builds the whole workspace")
-    return _unknown(f"cargo {sub or '(none)'} is not in the table")
+    if sub not in CARGO_HEAVY:
+        return _unknown(f"cargo {sub or '(none)'} is not in the table")
+    if "--workspace" in args or "--all" in args:
+        return _result(BUILD_WORKSPACE, f"cargo {sub} --workspace compiles every member")
+    packages = _packages(args)
+    if len(packages) == 1 and not any(ch in packages[0] for ch in "*?["):
+        return _result(BUILD_CRATE, f"cargo {sub} is scoped to one package")
+    if packages:
+        return _result(BUILD_WORKSPACE, f"cargo {sub} names several or glob packages; charged as the workspace")
+    return _result(BUILD_WORKSPACE, f"cargo {sub} without a package selector builds the whole workspace")
 
 
 def _trusted_checks(argv, trust_file):
     flags = {argv[i]: argv[i + 1] for i in range(len(argv) - 1) if argv[i].startswith("--")}
-    repo = flags.get("--repo")
     try:
         with open(trust_file) as handle:
-            checks = json.load(handle)["repos"][repo]["checks"]
+            checks = json.load(handle)["repos"][flags.get("--repo")]["checks"]
         return [c["argv"] for c in checks if isinstance(c, dict) and isinstance(c.get("argv"), list)]
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
-def classify(argv, trust_file=DEFAULT_TRUST, _depth=0):
-    tokens = strip_wrappers(argv)
-    if not tokens:
-        return _unknown("empty command")
-    if tokens == ["<env-program>"]:
-        return _unknown("an environment variable that names a program to run precedes the command")
+def _git(args, tokens):
+    if any(a == opt or a.startswith(opt + "=") for a in tokens for opt in GIT_PROGRAM_OPTIONS):
+        return _unknown("git option that executes a program")
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in GIT_GLOBAL_WITH_VALUE else 1
+    sub = args[i] if i < len(args) else ""
+    return _result(LIGHT, f"git {sub} is read-only and runs no hook") if sub in GIT_LIGHT else _unknown(f"git {sub or '(none)'} may run hooks or commands")
+
+
+def _classify_core(tokens, notes, trust_file, depth):
     base, args = os.path.basename(tokens[0]), tokens[1:]
-    script = next((a for a in args if not a.startswith("-")), "") if base.startswith("python") else ""
-    wrapper = os.path.basename(script) == WRAPPER_SCRIPT and _under(script, SCRIPT_DIR)
-    pinned = os.path.basename(script) in PINNED_SCRIPTS and _under(script, LOCAL_DIR)
-    if wrapper:
-        if _depth:
+    if base == "<module>":
+        name = args[0]
+        if name in NATIVE_GATE:
+            return _result(BUILD_CRATE, f"python -m {name} is a native test/type gate")
+        return _result(LIGHT, f"python -m {name} is a formatter") if name in MODULE_LIGHT else _unknown(f"python -m {name} is not in the table")
+    script = args[0] if base.startswith("python") and args and not args[0].startswith("-") else ""
+    if script and os.path.basename(script) == WRAPPER_SCRIPT and _under(script, SCRIPT_DIR):
+        if depth:
             return _unknown("nested trust-file wrapper")
         checks = _trusted_checks(args, trust_file)
         if not checks:
             return _unknown("owner-merge-local-ci.py: no pinned checks for this repo in the trust file; declare the class yourself")
-        parts = [classify(c, trust_file, _depth + 1) for c in checks]
+        parts = [classify(c, trust_file, depth + 1) for c in checks]
         if any(p["weight"] == "unknown" for p in parts):
             return _unknown("a pinned check is not recognised: " + "; ".join(p["reason"] for p in parts if p["weight"] == "unknown")[:200])
         top = max(parts, key=lambda p: ORDER[p["class"]])
         return _result(top["class"], f"heaviest of {len(parts)} pinned checks: {top['reason']}")
-    recognised = base in LIGHT_BINARIES | {"cargo", "uv", "claude", "pytest", "mypy", "npm", "pnpm", "yarn", "go", "git", "gh"}
-    if (len(args) == 1 and args[0] in ("--help", "-h", "--version", "-V") and (recognised or _depth)
-            and base not in DOCKER_BINARIES | {"mvn", "gradle", "gradlew"}):
-        return _result(LIGHT, f"{base} with only a help/version flag prints and exits")
-    if pinned:
+    if script and os.path.basename(script) in PINNED_SCRIPTS and _under(script, LOCAL_DIR) and len(args) == 1:
         return _result(*PINNED_SCRIPTS[os.path.basename(script)])
+    recognised = base in LIGHT_BINARIES or base in ("cargo", "uv", "claude", "pytest", "mypy", "npm", "pnpm", "yarn", "go", "git", "gh")
+    if len(args) == 1 and args[0] in HELP_FLAGS and (recognised or depth) and base not in DOCKER_BINARIES | {"mvn", "gradle", "gradlew"}:
+        return _result(LIGHT, f"{base} with only a help/version flag prints and exits")
     if base in DOCKER_BINARIES:
-        sub = next((a for a in args if not a.startswith("-")), "")
-        return _result(LIGHT, f"{base} {sub} only inspects") if sub in DOCKER_LIGHT else _result(CONTAINER, f"{base} runs containers (docker-exclusive)")
-    if base == "cargo" or base == "cargo-nextest":
+        if args and args[0] in DOCKER_LIGHT:
+            return _result(LIGHT, f"{base} {args[0]} only inspects")
+        return _result(CONTAINER, f"{base} runs containers (docker-exclusive)")
+    if base in ("cargo", "cargo-nextest"):
         return _cargo(args if base == "cargo" else ["nextest"] + args)
     if base in NATIVE_GATE:
         return _result(BUILD_CRATE, f"{base} is a native test/type gate (no docker, no cargo target)")
     if base in ("npm", "pnpm", "yarn", "bun"):
-        sub = next((a for a in args if not a.startswith("-") and a != "run" and a != "exec"), "")
+        sub = next((a for a in args if not a.startswith("-") and a not in ("run", "exec")), "")
         return _result(BUILD_CRATE, f"{base} {sub} is a native build/test") if sub in NODE_HEAVY else _unknown(f"{base} {sub or '(none)'} is not in the table")
     if base == "go":
         sub = args[0] if args else ""
@@ -173,19 +220,31 @@ def classify(argv, trust_file=DEFAULT_TRUST, _depth=0):
         sub = next((a for a in args if not a.startswith("-")), "")
         return _result(BUILD_CRATE, f"make {sub} is a native build/test") if sub in MAKE_HEAVY else _unknown(f"make {sub or '(default)'} is not in the table")
     if base == "git":
-        rest, i = args, 0
-        while i < len(rest) and rest[i].startswith("-"):
-            i += 2 if rest[i] in GIT_GLOBAL_WITH_VALUE else 1
-        sub = rest[i] if i < len(rest) else ""
-        if any(a in GIT_RUNS_PROGRAMS or a.startswith("--ext-diff") for a in tokens):
-            return _unknown("git option that executes a program")
-        return _result(LIGHT, f"git {sub} is read-only and runs no hook") if sub in GIT_LIGHT else _unknown(f"git {sub or '(none)'} may run hooks or commands")
+        return _git(args, tokens)
     if base == "gh":
-        sub = next((a for a in args if not a.startswith("-")), "")
-        return _result(LIGHT, f"gh {sub} is a GitHub read/write call") if sub in GH_LIGHT else _unknown(f"gh {sub or '(none)'} may run an extension or alias")
+        words = [a for a in args if not a.startswith("-")]
+        allowed = GH_LIGHT.get(words[0] if words else "", False)
+        ok = allowed is None or (allowed and len(words) > 1 and words[1] in allowed)
+        return _result(LIGHT, f"gh {' '.join(words[:2])} is a GitHub read call") if ok else _unknown(f"gh {' '.join(words[:2]) or '(none)'} is not a known read form")
     if base in LIGHT_BINARIES:
+        if any(a == deny or a.startswith(deny + "=") or a.startswith(deny) and deny.startswith("--") for a in args for deny in LIGHT_BINARIES[base]):
+            return _unknown(f"{base} option that executes a program")
         return _result(LIGHT, f"{base} is a short read/inspect/format/lint command")
     return _unknown(f"{base} is not recognised (scripts, bash -c and pre-commit hide their work)")
+
+
+def classify(argv, trust_file=DEFAULT_TRUST, depth=0):
+    tokens, notes = peel(argv)
+    if not tokens:
+        return _unknown("empty command")
+    if tokens == ["<?>"]:
+        return _unknown("a wrapper form this classifier does not model (flag after a launcher, unknown uv flag, rtk/timeout form)")
+    out = _classify_core(tokens, notes, trust_file, depth)
+    if out["weight"] == "light" and "env" in notes:
+        return _unknown("an environment assignment precedes the command: it can name a program to run")
+    if out["weight"] == "light" and "uv" in notes:
+        return _result(BUILD_CRATE, "uv run may sync or build the project environment first")
+    return out
 
 
 def main(argv=None):
