@@ -106,6 +106,18 @@ class Classifier(unittest.TestCase):
                      ('git', 'bisect', 'run', 'x'), ('git', 'merge', 'x'), ('git', 'checkout', 'x')):
             self.assertEqual(self.kind(*argv)[0], 'unknown', argv)
 
+    def test_second_review_holes_rtk_wrappers_uv_value_flags_help_on_scripts_and_cargo_after_double_dash(self):
+        for argv in (('rtk', 'test', 'cargo', 'test'), ('rtk', 'err', 'cargo', 'build'), ('uv', 'run', '--config-file', 'ls', 'cargo', 'build'),
+                     ('cargo', 'test', '--', '-p', 'foo'), ('cargo', 'test', '-p', 'a', '-p', 'b', '-p', 'c')):
+            self.assertEqual(self.kind(*argv)[0], 'heavy', argv)
+        self.assertEqual(self.kind('cargo', 'test', '--', '-p', 'foo')[1], 'build-workspace')       # `-p` after -- is the test binary's
+        for argv in (('./build.sh', '--help'), ('./run-tests.sh', '-h'), ('bash', '-h'), ('cargo', 'vendor'),
+                     ('GIT_EXTERNAL_DIFF=./x', 'git', 'diff'), ('git', '-c', 'core.fsmonitor=x', 'status'), ('git', 'diff', '--ext-diff'),
+                     ('gh', 'extension', 'exec', 'x'), ('gh', 'alias', 'set', 'a', 'b'), ('sort', '--compress-program=x')):
+            self.assertEqual(self.kind(*argv)[0], 'unknown', argv)
+        self.assertEqual(self.kind('rtk', 'git', 'status'), ('light', 'light'))                  # rtk's rewrite of a real light command stays light
+        self.assertEqual(self.kind('gh', 'pr', 'view', '3'), ('light', 'light'))
+
     def test_only_package_selectors_scope_cargo_to_one_package(self):
         self.assertEqual(self.kind('cargo', 'test', '-p', 'one', '--lib'), ('heavy', 'build-crate'))
         self.assertEqual(self.kind('cargo', 'test', '--package=one'), ('heavy', 'build-crate'))
