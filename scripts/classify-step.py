@@ -14,6 +14,9 @@ The failure direction that matters is UNDER-charging (heavy work called light), 
 every other command, flag or wrapper form is `unknown` or heavy, never light. It never guesses and never executes anything. A wrapper
 that hides its work (`owner-merge-local-ci.py record`) is classified by the checks the owner's pinned trust file lists for that repo,
 and the heaviest check wins. The tool reads nothing else and writes nothing.
+
+Limits: it sees argv only. A tool's own config (a repo's `diff.external`, a `.cargo/config.toml` alias) can name a program the argv does not, so
+a hostile checkout is out of scope; and a symlink inside a trusted tool directory is not followed.
 """
 import argparse
 import json
@@ -68,7 +71,7 @@ LIGHT_BINARIES = {"jq": (), "yq": (), "grep": (), "rg": ("--pre", "--pre-glob", 
                   "echo": (), "printf": (), "test": (), "true": (), "false": (), "sleep": (), "mkdir": (), "cp": (), "mv": (), "touch": (),
                   "stat": (), "date": (), "basename": (), "dirname": (), "tr": (), "cut": (), "ruff": (), "black": (), "isort": (),
                   "shellcheck": (), "yamllint": (), "codespell": (), "gitleaks": (), "actionlint": ("-shellcheck", "-pyflakes"),
-                  "markdownlint": ("--rules", "-r", "--custom-rules"), "shasum": (), "sha256sum": (), "readlink": (), "realpath": (),
+                  "markdownlint": ("--rules", "-r", "--custom-rules", "--config", "-c"), "shasum": (), "sha256sum": (), "readlink": (), "realpath": (),
                   "wait": (), "tee": ()}
 MODULE_LIGHT = {"json.tool", "ruff", "black", "isort"}
 HELP_FLAGS = ("--help", "-h", "--version", "-V")
@@ -98,6 +101,8 @@ def peel(argv):
     tokens, notes = [t for t in argv if isinstance(t, str)], set()
     while tokens:
         base = os.path.basename(tokens[0])
+        if "/" in tokens[0] and not _is_assignment(tokens[0]) and os.path.dirname(tokens[0]) not in TRUSTED_BIN_DIRS:
+            return tokens, notes                  # a launcher/tool at a repo-local path is not the system one: _classify_core says unknown
         if _is_assignment(tokens[0]):
             notes.add("env")
             tokens = tokens[1:]
@@ -128,7 +133,7 @@ def peel(argv):
                     return ["<?>"], notes
             notes.add("uv")
             tokens = rest[i:]
-        elif base.startswith("python") and len(tokens) > 2 and tokens[1] == "-m":
+        elif base.startswith("python") and len(tokens) > 2 and tokens[1] == "-m" and ("/" not in tokens[0] or os.path.dirname(tokens[0]) in TRUSTED_BIN_DIRS):
             notes.add("module")
             return ["<module>", tokens[2]] + tokens[3:], notes
         else:
@@ -151,7 +156,10 @@ def _packages(args):
 
 
 def _cargo(args):
-    sub = next((a for a in args if not a.startswith("+") and not (a.startswith("-") and a not in ("--version", "-V"))), "")
+    lead = [a for a in args if not a.startswith("+")][:1]      # the subcommand must come first (after an optional +toolchain)
+    sub = lead[0] if lead else ""
+    if sub.startswith("-") and sub not in ("--version", "-V"):
+        return _unknown("a cargo flag before the subcommand can swallow it (`cargo --config version build`)")
     if sub in CARGO_LIGHT:
         return _result(LIGHT, f"cargo {sub} does not compile the workspace")
     if sub not in CARGO_HEAVY:
