@@ -696,9 +696,14 @@ def classify_command(src, cwd):
                 if len(seg_words) > 2 or (len(seg_words) == 2 and seg_words[1].startswith("-")):
                     failed = failed or (False, "cd form")
                     continue
-                nxt = os.path.normpath(os.path.join(cur, tilde(seg_words[1]))) if len(seg_words) == 2 else HOME  # bash -L: logical path; secret_hit also checks the resolved one
-                if secret_hit(nxt, cur):
-                    return False, "secret"
+                raw = tilde(seg_words[1]) if len(seg_words) == 2 else HOME
+                nxt = os.path.normpath(os.path.join(cur, raw))
+                real = os.path.realpath(nxt)
+                if ".." in raw.split("/") and real != nxt:  # logical and physical `..` disagree through a symlink: do not guess
+                    failed = failed or (False, "cd dotdot through symlink")
+                    continue
+                secret_hit(real, cur)
+                nxt = real
                 cur = nxt
                 stages += 1
                 continue
