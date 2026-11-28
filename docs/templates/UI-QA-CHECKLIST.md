@@ -18,7 +18,7 @@ stay local and are referenced by path only. See
 
 For claimed creative improvements, add one row per cue and representative viewport. Review the unannotated full frame at 1× before opening diagnostic crops.
 
-| Intended cue, location and time | Matched clips and viewport | Unaided observation and viewing method | Regressions and artistic verdict |
+| Intended cue, location and time | Matched clips, reviewed interval and viewport | Reviewer, method and cue independently identified? | Regressions and artistic verdict |
 |---|---|---|---|
 | | | | |
 
