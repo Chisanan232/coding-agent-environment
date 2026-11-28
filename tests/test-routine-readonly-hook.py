@@ -38,6 +38,7 @@ ALLOW = [
     "find . -name '*.py' -type f | wc -l", "jq .a /tmp/x.json", "diff -u README.md /tmp/x", "python3 %s/scripts/memory-admission.py check --weight heavy" % MV,
 ]
 FALLTHROUGH = [
+    "printf -vx y", "printf -- '%s' a",
     "printf -v 'a[$(echo X)]' x", "[ -v 'a[$(echo X)]' ]", "test -v x", "for PATH in /tmp; do cat x; done", "for HOME in /tmp; do ls; done", "rtk grep x . -- --pre ./a.sh",
     "rtk grep x . -- --hidden", "rtk grep . . -g '.[e]nv'", "rtk grep . ~/Bryant-Developments", "gh pr view 1 --json body -cq env", "git diff --help", "git log -h",
     "cd ~bryant; cat .claude.json", "cargo metadata --offline --locked ; frobnicate", "env X=1 ls", "FOO=1 ls; echo hi",

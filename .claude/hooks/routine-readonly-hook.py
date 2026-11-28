@@ -489,9 +489,9 @@ def ok_gh(args):
                     "--label", "--base", "--head", "--branch", "--workflow", "--status")) and "-q" not in args and "--jq" not in args
 
 
-def no_cargo_wrapper():
+def no_cargo_wrapper(cwd):
     """cargo runs `rustc -vV` through build.rustc-wrapper from any .cargo/config* above the cwd: refuse when one is configured (cwd comes from the event)."""
-    d = os.path.realpath(os.getcwd())
+    d = os.path.realpath(cwd)
     dirs = []
     while True:
         dirs.append(d)
@@ -503,24 +503,24 @@ def no_cargo_wrapper():
         for name in ("config.toml", "config"):
             f = os.path.join(d, ".cargo", name)
             try:
-                if os.path.isfile(f) and re.search(r"wrapper|runner", open(f).read()):
+                if os.path.isfile(f) and re.search(r"wrapper|runner|rustc|include|linker", open(f).read()):
                     return False
             except OSError:
                 return False
     return True
 
 
-def ok_cargo(args):
+def ok_cargo(args, cwd):
     if args in (["--version"], ["-V"]):
         return True
     if not args:
         return False
     v, rest = args[0], args[1:]
     if v == "metadata":
-        return "--offline" in rest and no_cargo_wrapper() and flags_ok(rest, long_exact=("--offline", "--no-deps", "--frozen", "--locked"), long_prefix=("--format-version=",),
+        return "--offline" in rest and no_cargo_wrapper(cwd) and flags_ok(rest, long_exact=("--offline", "--no-deps", "--frozen", "--locked"), long_prefix=("--format-version=",),
                                                  valued=("--format-version",))
     if v == "tree":
-        return "--offline" in rest and no_cargo_wrapper() and flags_ok(rest, short="eid", long_exact=("--offline", "--frozen", "--locked", "--workspace"), long_prefix=("--depth=",),
+        return "--offline" in rest and no_cargo_wrapper(cwd) and flags_ok(rest, short="eid", long_exact=("--offline", "--frozen", "--locked", "--workspace"), long_prefix=("--depth=",),
                                                  valued=("--depth", "-p", "--package"))
     return False
 
@@ -629,7 +629,7 @@ def judge(argv, cwd, state):
     if prog == "gh":
         return ok_gh(args)
     if prog == "cargo":
-        return ok_cargo(args)
+        return ok_cargo(args, cwd)
     if prog in ("python3", "python"):
         return ok_python(args, cwd)
     if prog == "jq":
@@ -643,7 +643,7 @@ def judge(argv, cwd, state):
     if prog == "echo":  # prints its operands; `echo ---` is text, not an option
         return True
     if prog == "printf":
-        return "-v" not in args  # printf -v 'a[$(cmd)]' evaluates the subscript
+        return not any(a.startswith("-") for a in args)  # printf -v 'a[$(cmd)]' evaluates the subscript; no options at all
     if prog in SIMPLE_FLAGS:
         short, valued = SIMPLE_FLAGS[prog]
         return flags_ok(args, short=short, valued=valued)
@@ -720,7 +720,7 @@ def _classify(src, cwd):
                 old, new = pending
                 cwds = [new] if op_before == "&&" else old + [new]
                 pending = None
-            if any(t[0] == "redir" for t in seg) and not all(redir_ok(t[1], t[2], t[3], cwds[-1]) for t in seg if t[0] == "redir"):
+            if any(t[0] == "redir" for t in seg) and not all(redir_ok(t[1], t[2], t[3], c) for c in cwds for t in seg if t[0] == "redir"):
                 failed = failed or (False, "redirect")
             words = [t for t in seg if t[0] == "word"]
             seg_words = [expand_word(w, vars_) for w in words]
