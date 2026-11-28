@@ -78,7 +78,7 @@ System or the user's need justifies it, and say why in the design brief.
 
 ### Claims about creative motion or material changes
 
-Require matched before-and-after recordings at normal viewing scale and 1× speed for representative viewports. Record the visible cue, location, time, evidence, unaided viewer observation and regressions for each claim. Use independent critique when supported and disclose its viewing method. Keep implementation, functional and numerical results separate from perceptual effectiveness and artistic judgment. A change seen only in diagnostic views is perceptually negligible in the assessed ordinary view. Missing ordinary-playback evidence leaves perception unverified. Record the owner’s artistic decision separately.
+Require matched before-and-after recordings at normal viewing scale and 1× speed for representative viewports. Record the visible cue, location, time, evidence, unaided viewer observation and regressions for each claim. Use independent critique when supported and disclose its viewing method. Keep implementation, functional and numerical results separate from perceptual effectiveness and artistic judgment. Attribute each identification or missed cue to its reviewer, actual method, reviewed interval and viewport through the final verdict. Missing ordinary-playback evidence leaves perception unverified. A claim of absence needs a control or proof covering the stated property and scope. Record the owner’s artistic decision separately.
 
 ## Platform QA
 
