@@ -18,6 +18,7 @@ find -exec / -delete, sort -o, awk system()/pipes/redirects, rg --pre), and any 
 Read-only does not mean harmless to read: the SECRET list keeps credentials, key material, shell history and home-level Claude Code
 configuration out of unattended reads.
 """
+import glob
 import hashlib
 import json
 import os
@@ -48,8 +49,10 @@ def secret_hit(word, cwd):
     if not word:
         return False
     cands = {word}
-    if "=" in word and word.startswith("-"):
-        cands.add(word.split("=", 1)[1])
+    for sep in ("=", ":"):  # --file=PATH, and git REV:PATH (`git show HEAD:.env`)
+        if sep in word:
+            cands.add(word.split(sep, 1)[1])
+            cands.add(word.rsplit(sep, 1)[1])
     for cand in list(cands):
         p = os.path.expanduser(cand)
         if not p.startswith("/"):
@@ -59,6 +62,13 @@ def secret_hit(word, cwd):
         if not re.search(r"[*?\[]", p):
             try:
                 cands.add(os.path.realpath(p))
+            except OSError:
+                pass
+        else:  # a glob can expand to a credential file: judge what it expands to as well as the pattern
+            try:
+                for hit in sorted(glob.glob(p))[:500]:
+                    cands.add(hit)
+                    cands.add(os.path.realpath(hit))
             except OSError:
                 pass
     for c in cands:
@@ -222,6 +232,8 @@ def expand(parts, vars_):
         if kind == "lit":
             out.append(val)
         elif val in vars_:
+            if re.search(r"[\s*?\[]", vars_[val]):  # unquoted use would word-split or glob, which this parser does not model
+                raise Reject("variable value needs splitting")
             out.append(vars_[val])
         else:
             raise Reject("unknown variable")
@@ -313,12 +325,37 @@ def ok_find(args):
     return not any(a in bad for a in args)
 
 
+SORT_SAFE_SHORT = set("nrukfbsdgMhVRiCc")
+SORT_SAFE_LONG = ("--numeric-sort", "--reverse", "--unique", "--key=", "--field-separator=", "--ignore-case", "--stable", "--human-numeric-sort",
+                  "--version-sort", "--month-sort", "--general-numeric-sort", "--ignore-leading-blanks", "--dictionary-order", "--check")
+
+
 def ok_sort(args):
-    return not has_flag(args, "-o", "--output", "--compress-program", prefix=("--output=", "--compress-program=", "-o"))
+    """Allowlist: -o/--output (file write) and --compress-program (exec) are not in it, nor any abbreviation of them."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-k", "-t"):
+            i += 2; continue
+        if a.startswith("--"):
+            if not a.startswith(SORT_SAFE_LONG):
+                return False
+        elif a.startswith("-") and a != "-":
+            body = a[1:]
+            if body[:1] in ("k", "t") and len(body) > 1:  # -k2,2 / -t,
+                i += 1; continue
+            if not set(body) <= SORT_SAFE_SHORT:
+                return False
+        i += 1
+    return True
 
 
 def ok_uniq(args):
-    return len([a for a in args if not a.startswith("-")]) <= 1
+    """uniq [IN [OUT]]: the second operand is an output file, and `-` counts as an operand."""
+    flags = [a for a in args if a.startswith("-") and a != "-"]
+    if any(not set(f[1:]) <= set("cduiD") for f in flags if not f.startswith("--")) or any(f.startswith("--") for f in flags):
+        return False
+    return len([a for a in args if a == "-" or not a.startswith("-")]) <= 1
 
 
 def ok_date(args):
@@ -404,7 +441,7 @@ def ok_cargo(args):
     if v == "tree":
         return has_flag(args, "--offline", "--frozen")
     if v in ("test", "check", "build", "clippy"):
-        return not has_flag(args, "--fix", "--target-dir", prefix=("--target-dir=", "--config", "--manifest-path=/"))
+        return not has_flag(args, "--fix", "--target-dir", "--config", "--manifest-path", prefix=("--target-dir=", "--config=", "--manifest-path="))
     if v == "fmt":
         return has_flag(args, "--check")
     if v == "nextest":
@@ -440,17 +477,17 @@ def ok_python(args, cwd):
     if args == ["--version"] or args == ["-V"]:
         return True
     if args[:2] == ["-m", "pytest"]:
-        return not has_flag(args, "-p", "--rootdir=/", prefix=("-p",))
+        return not has_flag(args, "-p", "-c", "--confcutdir", "--rootdir", prefix=("-p", "-c", "--confcutdir=", "--rootdir=", "--basetemp="))
     return ok_script(args, cwd)
 
 
 def ok_pytest(args):
-    return not has_flag(args, "-p", prefix=("-p", "--basetemp=/"))
+    return not has_flag(args, "-p", "-c", "--confcutdir", "--rootdir", prefix=("-p", "-c", "--confcutdir=", "--rootdir=", "--basetemp="))
 
 
 SIMPLE_READ = {"cat", "head", "tail", "wc", "nl", "cut", "tr", "echo", "printf", "df", "du", "ls", "stat", "file", "pwd", "basename", "dirname",
                "realpath", "readlink", "break", "continue", "diff", "cmp", "shasum", "md5", "column", "jq", "sleep", "true", "false", "test", "[", "uname", "whoami",
-               "uptime", "vm_stat", "tree", "rev", "paste", "comm", "expand", "fold", "od", "xxd", "seq", "which"}
+               "uptime", "vm_stat", "tree", "rev", "paste", "comm", "expand", "fold", "od", "seq", "which"}
 RTK_NATIVE = {"ls", "tree", "find", "wc", "df", "du", "diff", "cat", "head", "tail"}
 
 
@@ -507,8 +544,6 @@ def judge(argv, cwd, state):
         return False
     if prog in SIMPLE_READ:
         if prog == "tree" and has_flag(args, "-o"):
-            return False
-        if prog == "xxd" and len([a for a in args if not a.startswith("-")]) > 1:
             return False
         return True
     return False
