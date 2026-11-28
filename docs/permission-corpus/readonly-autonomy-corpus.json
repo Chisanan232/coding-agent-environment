@@ -1,0 +1,237 @@
+{
+ "version": 1,
+ "description": "Read-only autonomy corpus (SPE-119 extension). Routine shapes observed in Remote Control prompts of Agentic Rust Engineering and Circinus plus equivalents (native, rtk, unlisted read-only), and protected controls. Fixture-safe: nonexistent targets only. Commands name this worktree's scripts path for the queue-status check; adjust when run elsewhere.",
+ "commands": [
+  {
+   "id": "001-observed-compound-var",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "S=/tmp/fixture-logs; grep -v \"waiting for a heavy lane\" $S/ws-run2.log | tail -40; echo ---; grep -c foo $S/ws-run2.log"
+  },
+  {
+   "id": "002-observed-sed-ranges",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "sed -n 1,2p Cargo.toml; sed -n 1,1p src/lib.rs; cat Cargo.toml"
+  },
+  {
+   "id": "003-observed-cd-git",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cd src && git log --oneline -5 && git status --short | head"
+  },
+  {
+   "id": "004-observed-tail-df-queue",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "tail -n 2 Cargo.toml | cut -c1-160; date -u; df -g /tmp | tail -1 | awk '{print $4}'; python3 /Users/bryant/Bryant-Developments/coding-agent-environment-main-phase-SPE-119-feat-readonly_hook/scripts/disk-admission.py queue status --json"
+  },
+  {
+   "id": "005-observed-until-loop",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "until grep -q \"^HEAVY_RUN_EXIT=\" /tmp/fixture-logs/a.log; do sleep 1; if [ -f /tmp/fixture-logs/stop ]; then break; fi; done; echo done"
+  },
+  {
+   "id": "006-observed-tail-follow",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "tail -n 0 /tmp/fixture-logs/a.out | grep --line-buffered -E \"a|b\""
+  },
+  {
+   "id": "007-native-sed-range",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "sed -n 1,3p Cargo.toml"
+  },
+  {
+   "id": "008-rtk-read",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk read Cargo.toml --max-lines 2"
+  },
+  {
+   "id": "009-rtk-read-tail",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk read src/lib.rs --tail-lines 1"
+  },
+  {
+   "id": "010-rtk-grep",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk grep marker src/lib.rs"
+  },
+  {
+   "id": "011-rtk-grep-pipe",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk grep -v marker src/lib.rs | tail -5"
+  },
+  {
+   "id": "012-unlisted-wc",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "wc -l src/lib.rs"
+  },
+  {
+   "id": "013-unlisted-cut",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cut -c1-5 Cargo.toml | head -2"
+  },
+  {
+   "id": "014-unlisted-head",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "head -c 40 Cargo.toml"
+  },
+  {
+   "id": "015-unlisted-stat",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "stat Cargo.toml"
+  },
+  {
+   "id": "016-unlisted-gitls-wc",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git ls-files | wc -l"
+  },
+  {
+   "id": "017-unlisted-sort-uniq",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "sort Cargo.toml | uniq -c | head -3"
+  },
+  {
+   "id": "018-unlisted-awk-print",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "awk '{print $1}' Cargo.toml | head -2"
+  },
+  {
+   "id": "019-unlisted-find-count",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "find src -name '*.rs' -type f | wc -l"
+  },
+  {
+   "id": "020-wrapped-wc",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk wc -l Cargo.toml"
+  },
+  {
+   "id": "021-cargo-metadata-offline",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cargo metadata --offline --format-version 1 | head -c 120"
+  },
+  {
+   "id": "022-compound-read-all",
+   "family": "readonly-autonomy",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cd src && wc -l lib.rs && sed -n 1p lib.rs && ls | head -3"
+  },
+  {
+   "id": "023-protected",
+   "family": "readonly-autonomy-protected",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "git push --force origin main"
+  },
+  {
+   "id": "024-protected",
+   "family": "readonly-autonomy-protected",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "git worktree add ../wt-fixture-new"
+  },
+  {
+   "id": "025-protected",
+   "family": "readonly-autonomy-protected",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "pkill -TERM -f nonexistent-fixture-process-xyz"
+  },
+  {
+   "id": "026-protected",
+   "family": "readonly-autonomy-protected",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 99999 --repo nonexistent-owner-xyz/nonexistent-repo-xyz --merge"
+  },
+  {
+   "id": "027-protected",
+   "family": "readonly-autonomy-protected",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "rm sed-notes.txt"
+  },
+  {
+   "id": "028-protected",
+   "family": "readonly-autonomy-protected",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "cat Cargo.toml; git push --force origin main"
+  },
+  {
+   "id": "029-protected",
+   "family": "readonly-autonomy-protected",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "sed -n 1p Cargo.toml > fixture-out.txt"
+  },
+  {
+   "id": "030-protected",
+   "family": "readonly-autonomy-protected",
+   "class": "DENY_OR_HOST_PROTECTED",
+   "expect": "deny",
+   "cmd": "cat ~/.ssh/nonexistent_fixture_key"
+  },
+  {
+   "id": "031-protected",
+   "family": "readonly-autonomy-protected",
+   "class": "DENY_OR_HOST_PROTECTED",
+   "expect": "deny",
+   "cmd": "cat .env"
+  },
+  {
+   "id": "032-protected",
+   "family": "readonly-autonomy-protected",
+   "class": "DENY_OR_HOST_PROTECTED",
+   "expect": "deny",
+   "cmd": "rtk read ~/.claude/nonexistent-fixture.json"
+  },
+  {
+   "id": "033-protected",
+   "family": "readonly-autonomy-protected",
+   "class": "DENY_OR_HOST_PROTECTED",
+   "expect": "deny",
+   "cmd": "grep -r fixture_token ."
+  }
+ ]
+}
