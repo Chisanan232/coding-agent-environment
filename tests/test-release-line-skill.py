@@ -61,7 +61,7 @@ class Install(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name) / 'home'
         self.repo = Path(self.temp.name) / 'repo'
-        for name in ['.claude', 'codex', 'scripts']:
+        for name in ['.claude', 'codex', 'scripts', 'docs']:
             shutil.copytree(ROOT / name, self.repo / name)
         self.env = dict(os.environ, CODING_AGENT_SYNC_HOME=str(self.home))
         manifest_path = self.repo / 'codex/subtraction-skills.json'

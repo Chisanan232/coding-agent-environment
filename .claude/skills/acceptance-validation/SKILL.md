@@ -50,7 +50,11 @@ a pre-merge validation report from an external tester perspective.
       capture page snapshots for pass evidence and screenshots for failures.
    3. If neither is configured: note the gap in the report; describe manual steps taken.
    Record result in the validation report.
-   For frontend work, also read the project design specs, run the app, and verify
+   For frontend work, also read the project design specs and apply the task mode in
+   the installed `references/UI-UX-POLICY.md` (source in the environment repository’s
+   `docs/UI-UX-POLICY.md`). For a greenfield surface
+   or an authorized reboot, use the agreed references and one active primary. A
+   direct implementation request may start with a browser prototype. Then run the app and verify
    through Playwright screenshots on a personal Mac only. Screenshots must be
    sanitized of secrets and personal data, and you must never invent screenshots:
    if the app cannot be run or captured, record that gap instead.

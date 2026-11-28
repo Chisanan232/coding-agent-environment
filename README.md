@@ -235,6 +235,9 @@ local snapshot; Codex receives a managed physical Visual Explainer copy while
 Claude uses the native local-marketplace plugin. Generated runtime files and
 authentication state are not committed.
 
+For general and creative frontend work, use `scripts/profile-install.sh --frontend --dry-run`
+then the [scoped frontend install and rollback workflow](docs/VISUAL-SKILLS.md#frontend-design-skills). The [capability inventory](docs/FRONTEND-COVERAGE.md) distinguishes native discovery and actual execution across eight disciplines. The [evaluation matrix](evals/frontend/MATRIX.md) links each brief to its fixture and acceptance evidence.
+
 Successful installation is not behavior proof: start a fresh Codex process after
 applying. `scripts/sync-check.sh --codex` checks only the managed signal-first
 block, shared-skill bytes and canonical subtraction body/reference digests; it

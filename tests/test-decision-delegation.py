@@ -166,7 +166,7 @@ class Installation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             live = Path(temp) / "home"
             repo = Path(temp) / "repo"
-            for rel in [".claude", "codex", "scripts"]:
+            for rel in [".claude", "codex", "scripts", "docs"]:
                 shutil.copytree(ROOT / rel, repo / rel)
             manifest = json.loads((repo / "codex/subtraction-skills.json").read_text())
             for name, spec in manifest["skills"].items():

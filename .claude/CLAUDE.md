@@ -173,6 +173,9 @@ Campaign completion (mission and stop condition; detailed loop in `decision-dele
 - Do not re-ask for already-authorized work. Ask only for material product or scope decisions, actions outside authorization, or unavoidable credential or host interaction, with the proposal, recommendation, impact and minimal action, and keep working.
 <!-- coding-agent-environment:baseline:campaign-completion:end -->
 
+For frontend design, use the UI/UX policy bundled with `acceptance-validation`
+for task routing and browser evidence. Load only the selected primary.
+
 ---
 
 ## Workflow Path

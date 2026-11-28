@@ -62,6 +62,46 @@
           "claude-code": "native-user-marketplace-plugin"
         }
       }
+    },
+    "frontend": {
+      "version": 1,
+      "packages": {
+        "frontend-design": {
+          "state": "active",
+          "role": "general",
+          "repository": "https://github.com/anthropics/claude-plugins-official.git",
+          "revision": "a7ba5b93db0c7c8d17f3f1d25853adca79598a1a",
+          "paths": ["plugins/frontend-design/skills/frontend-design"],
+          "skill_path": "plugins/frontend-design/skills/frontend-design",
+          "license": "Apache-2.0",
+          "integrity": "sha256:cc0bb08818374b7bb74964d2a9869cca785da0c66355382390da0c8268001cda"
+        },
+        "frontend-skill": {
+          "state": "quarantined",
+          "role": "general",
+          "repository": "https://github.com/openai/skills.git",
+          "revision": "82d2c5b44ac234ec0f204f647562a4349d90ef43",
+          "paths": [
+            "skills/.curated/frontend-skill"
+          ],
+          "skill_path": "skills/.curated/frontend-skill",
+          "license": "Apache-2.0",
+          "integrity": "sha256:a78471b10f997e76cfbcb60cb95a8113ea70393d46c0c39270824b7cbbd15a2f"
+        },
+        "staggered-word-reveal": {
+          "state": "quarantined",
+          "role": "recipe",
+          "repository": "https://github.com/MengTo/Skills.git",
+          "revision": "3a8517e09e9a258a8b8a1dfdb71579abe75f1c22",
+          "paths": [
+            "LICENSE",
+            "agent-skills/web-design/staggered-word-reveal/SKILL.md"
+          ],
+          "skill_path": "agent-skills/web-design/staggered-word-reveal",
+          "license": "MIT",
+          "integrity": "sha256:8fd3cea4aedae50f7be5a1c35a318104407850b9026d8ac187925e7123715399"
+        }
+      }
     }
   }
 }

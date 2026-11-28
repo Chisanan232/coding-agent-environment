@@ -12,7 +12,7 @@ AUTHORITY = (
     'Product requirements and real users',
     'Product-owned Design System, brand, and Design Constitution',
     'Platform conventions',
-    'Impeccable art direction, critique, and refinement',
+    'Task-specific art direction',
     'Vercel Web Interface Guidelines review',
     'Optional references',
     'Rendered verification',
@@ -39,9 +39,9 @@ class UiUxPolicy(unittest.TestCase):
         self.assertIn('Framelink', row)
         self.assertIn('non-preferred', row)
 
-    def test_optional_tools_are_marked_not_installed(self):
-        section = self.text.split('### Optional, not installed', 1)[1]
-        self.assertIn('NOT INSTALLED', section)
+    def test_excluded_tools_are_outside_design_routing(self):
+        section = self.text.split('### Excluded from design routing', 1)[1]
+        self.assertIn('no active primary or recipe role', section)
         for name in OPTIONAL:
             self.assertIn(name, section)
 
@@ -49,7 +49,7 @@ class UiUxPolicy(unittest.TestCase):
         self.assertIn('Exactly **one** primary skill per task', self.text)
 
     def test_links_visual_skills_doc_without_duplicating_its_pins(self):
-        self.assertIn('(VISUAL-SKILLS.md)', self.text)
+        self.assertIn('/docs/VISUAL-SKILLS.md)', self.text)
         self.assertNotIn('2ab3cae7ac2c2a55d7386ca789d03c4fcd31816c', self.text)
         self.assertNotIn('6376b7727bb9b1d5d37ad3e4d96d969a6499917b', self.text)
 

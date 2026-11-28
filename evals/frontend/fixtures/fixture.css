@@ -1,0 +1,44 @@
+:root { color-scheme: light; --paper: #eee9d7; --ink: #203631; --rust: #a54125 }
+* { box-sizing: border-box }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 system-ui, sans-serif }
+main { max-width: 44rem; padding: clamp(1.25rem,5vw,3rem); margin: 0 auto }
+h1 { font: 400 clamp(2.3rem,6vw,4.6rem)/1 Georgia,serif; letter-spacing: -.045em; margin: .5rem 0 1.5rem }
+.stage { height: clamp(13rem,47vw,19rem); background: #d9d5c0; display: grid; place-items: center; overflow: hidden; position: relative; margin-bottom: 1.4rem }
+button { color: var(--paper); background: var(--ink); padding: .7rem 1.2rem; font: inherit; border: 0; min-height: 44px; cursor: pointer }
+:focus-visible { outline: 3px solid var(--rust); outline-offset: 3px }
+output { display: block; margin-top: .65rem; font-variant-numeric: tabular-nums }
+.track { display: inline-flex; align-items: center; margin-left: .5rem; border: 1px solid; border-radius: 1rem; width: 38px; height: 22px; vertical-align: middle }
+.track i { border-radius: 50%; width: 14px; height: 14px; margin-left: 3px; background: var(--paper); transition: transform 180ms ease-out }
+[aria-pressed="true"] .track i { transform: translateX(16px) }
+.frame { width: 72%; height: 82%; overflow: hidden; border: 6px solid #fff8e9 }
+.strip { height: 100%; display: flex; transition: transform 420ms cubic-bezier(.25,.76,.28,1) }
+.strip > * { width: 100%; flex-shrink: 0; object-fit: cover }
+.proof-detail { overflow: hidden }
+.proof-detail img { width: 100%; height: 100%; object-fit: cover; transform: scale(1.7); transform-origin: 72% 79% }
+.alternate .strip { transform: translateX(-100%) }
+.scroll { overflow-y: auto; overscroll-behavior: contain; scrollbar-color: var(--rust) var(--paper); height: 100%; width: 100% }
+.scroll:focus-visible { outline-offset: -4px }
+.pan { position: sticky; top: 0; height: 100%; overflow: hidden; background: var(--ink) }
+.pan img,.panorama img { width: 100%; height: 100%; object-fit: cover }
+.chapter { position: absolute; left: 1rem; bottom: 1rem; padding: .3rem .8rem; color: white; background: var(--ink); font: 1.4rem Georgia,serif }
+.distance { height: 180% }
+canvas { display: block; width: 100%; height: 100% }
+.rail { width: 62%; position: relative; height: 2px; background: var(--ink) }
+.weight { width: 30px; height: 42px; margin: -22px 0 0 -15px; background: var(--rust); border-radius: 50% 50% 42% 42%; border-bottom: 6px solid var(--ink) }
+.panorama { height: clamp(21rem, 60vw, 29rem); margin-top: 1rem }
+.panorama header { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: flex-end; padding: 1.4rem; color: white; background: linear-gradient(transparent 52%, rgb(20 35 30 / .92)) }
+.panorama h1 { font-size: clamp(3.5rem, 10vw, 7rem); margin: 0; transition: transform .6s ease-out }
+.panorama .caption { font-size: .85rem; font-weight: 650; letter-spacing: .12em; text-transform: uppercase }
+.alternate .panorama h1 { transform: translateX(.14em) }
+.panorama img { transform-origin: 76% 68%; transition: transform .65s cubic-bezier(.3,.04,.2,1) }
+.alternate .panorama img { transform: scale(1.55) translateX(-3%) }
+.perspective { perspective: 600px }
+.block { --side: 80px; width: var(--side); height: var(--side); transform-style: preserve-3d; transform: rotateX(-18deg) rotateY(25deg); transition: transform .48s cubic-bezier(.25,.76,.28,1) }
+.block i { position: absolute; inset: 0; background: #c9aa77; border: 2px solid var(--ink); backface-visibility: hidden; transform: rotateY(0deg) translateZ(40px) }
+.block i:nth-child(2) { transform: rotateY(90deg) translateZ(40px); background: #b05a38 }
+.block i:nth-child(3) { transform: rotateY(180deg) translateZ(40px); background: #44534a }
+.block i:nth-child(4) { transform: rotateY(270deg) translateZ(40px); background: #99967f }
+.block i:nth-child(5) { transform: rotateX(90deg) translateZ(40px); background: #ddcfac }
+.block i:nth-child(6) { transform: rotateX(-90deg) translateZ(40px); background: #756c52 }
+@media (prefers-reduced-motion: reduce) { *,*::before,*::after { transition: none !important; animation: none !important } }
+.perspective { touch-action: pan-y }

@@ -78,7 +78,7 @@ class BriefingInstallation(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='codex-briefing-') as temp:
             live = Path(temp) / 'home'
             desired_root = Path(temp) / 'repo'
-            for rel in ['.claude', 'codex', 'scripts']:
+            for rel in ['.claude', 'codex', 'scripts', 'docs']:
                 shutil.copytree(root / rel, desired_root / rel)
             manifest = json.loads((desired_root / 'codex/subtraction-skills.json').read_text())
             import hashlib
@@ -203,7 +203,7 @@ class DesiredStateDrift(unittest.TestCase):
             data['extraKnownMarketplaces'] = desired['extraKnownMarketplaces']
             settings.write_text(json.dumps(data))
             desired_root = live / 'desired-repo'
-            for rel in ['.claude', 'bin', 'scripts', 'codex']:
+            for rel in ['.claude', 'bin', 'scripts', 'codex', 'docs']:
                 shutil.copytree(root / rel, desired_root / rel)
             shutil.copy2(root / '.mcp.json', desired_root / '.mcp.json')
             manifest_path = desired_root / 'codex/subtraction-skills.json'

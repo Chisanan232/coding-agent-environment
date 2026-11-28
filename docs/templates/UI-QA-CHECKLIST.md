@@ -13,7 +13,8 @@ stay local and are referenced by path only. See
 - [ ] `prefers-reduced-motion: reduce` honoured
 - [ ] Light and dark schemes both legible
 - [ ] Contrast and text resizing meet the stated accessibility target
-- [ ] Existing Design System components reused; new ones justified
+- [ ] Rendered composition and interaction match the selected task mode and references
+- [ ] Representative motion frames and reduced-motion end state checked where relevant
 
 ## iOS
 

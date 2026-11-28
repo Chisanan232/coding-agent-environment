@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 700" role="img" aria-labelledby="title">
+<title id="title">Low Tide, an original study of coastal strata</title>
+<rect width="1000" height="700" fill="#dfdbc8"/>
+<circle cx="757" cy="178" r="74" fill="#c15d39"/>
+<path d="M0 533Q179 375 454 415T1000 301V700H0" fill="#989580"/>
+<path d="M0 538Q193 417 405 442T775 438T1000 378V700H0" fill="#424c46"/>
+<path d="M0 588Q240 462 448 486T772 475T1000 437V700H0" fill="#bb643e"/>
+<path d="M0 637Q258 528 453 548T829 518T1000 495V700H0" fill="#d2b07e"/>
+<path d="M0 655Q197 575 412 578T830 548T1000 523V700H0" fill="#293a36"/>
+<g fill="none" stroke="#e5cf9d" stroke-width="2" opacity=".72">
+<path d="M0 613Q211 491 448 514T806 498T1000 457"/>
+<path d="M0 627Q211 512 448 532T806 514T1000 476"/>
+</g></svg>
