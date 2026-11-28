@@ -104,6 +104,9 @@ def plan(args):
 def candidate(args):
     """A settings file for permission-host-matrix.py --candidate: the live permissions and autoMode, the rtk rewrite hook (so the hook sees
     what a real session sees) and this hook from --hook-src. No other live hook (supervisor, governors) is carried into a fixture run."""
+    if not args.out:
+        print("REFUSING: candidate mode needs --out")
+        return 2
     _, _, live = hr.load_settings(args.live)
     cfg = {k: live[k] for k in ("permissions", "autoMode") if k in live}
     rtk = [g for g in (live.get("hooks") or {}).get("PreToolUse", []) if any(str(h.get("command", "")).startswith("rtk hook") for h in g.get("hooks", []))]
@@ -193,7 +196,7 @@ def verify(args):
 
 def rollback(args):
     backups = Path(args.backup_dir)
-    receipts = sorted(backups.glob("receipt.readonly-hook.*.json"))
+    receipts = sorted(backups.glob("receipt.readonly-hook.*.json"), key=lambda r: r.stat().st_mtime)
     if not receipts:
         print("REFUSING: no receipt in %s" % backups)
         return 2
@@ -201,6 +204,9 @@ def rollback(args):
     live_p, dest = Path(args.live), Path(args.hook_dest)
     raw_bytes, raw, live = hr.load_settings(live_p)
     command = command_for(dest)
+    if state(live, command) == "conflict":
+        print("REFUSING: the settings hold a %s entry that is not exactly what apply wrote; fix it by hand, nothing was changed" % HOOK_NAME)
+        return 2
     if state(live, command) == "installed":
         hr.replace_if_unchanged(live_p, hr.serialise(without_groups(live, command), raw).encode(), raw_bytes)
         print("removed the two hook groups; every other setting kept as it is now")

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """PreToolUse hook: let provably read-only routine work run without a prompt (SPE-119).
 
-It reads one hook event on stdin and prints either nothing or one `permissionDecision: allow`. It NEVER prints deny or ask, so it can only
-remove prompts: an existing ask or deny rule still wins over a hook allow (measured, see docs/ROUTINE-COMMAND-AUTONOMY.md), and anything
-the parser does not fully understand falls through to the normal decision. Any error prints nothing and exits 0.
+It reads one hook event on stdin and prints nothing (fall through to the normal decision), `allow` (provably read-only), or `ask` (a
+credential-store read, a process kill, a recursive or forced delete, a git worktree change). It NEVER prints deny. An existing ask or deny
+rule still wins over a hook allow (measured, see docs/ROUTINE-COMMAND-AUTONOMY.md). Any error prints nothing and exits 0.
 
 Covered tools
   Bash, Monitor  the command is split into simple commands (; && || | newline, until/while/for/if bodies) and EVERY stage must be a
@@ -19,6 +19,7 @@ Read-only does not mean harmless to read: the SECRET list keeps credentials, key
 configuration out of unattended reads.
 """
 import glob
+import itertools
 import hashlib
 import json
 import os
@@ -31,7 +32,7 @@ LOG = os.environ.get("ROUTINE_READONLY_HOOK_LOG") or os.path.join(HOME, ".cache/
 
 # --------------------------------------------------------------------------- secret paths
 _SECRET_RE = re.compile("|".join([
-    r"(^|/)\.env(rc)?$", r"(^|/)\.env\.(?!(example|sample|template|dist|defaults?)$)[^/]+$",
+    r"(^|/)[^/]*\.env(rc)?$", r"(^|/)\.(vault-token|boto|s3cfg|oci|gradle|m2|zsh_sessions|bash_sessions|aws-vault|cargo/credentials(\.toml)?)(/|$)", r"(^|/)(gradle\.properties|settings\.xml|\.cargo/credentials)$", r"(^|/)\.env\.(?!(example|sample|template|dist|defaults?)$)[^/]+$",
     r"(^|/)\.(ssh|aws|gnupg|kube|azure|docker|terraform\.d|op)(/|$)", r"(^|/)\.config(/|$)", r"(^|/)\.local/share/(keyrings|gh)(/|$)",
     r"(^|/)\.(netrc|npmrc|yarnrc|pypirc|pgpass|git-credentials|terraformrc|my\.cnf|gitconfig|envrc)$",
     r"(^|/)\.git/(config|credentials)$", r"(^|/)\.claude/settings\.local\.json$",
@@ -44,7 +45,7 @@ _SECRET_RE = re.compile("|".join([
 _HOME_CLAUDE = (os.path.join(HOME, ".claude"), os.path.join(HOME, ".claude.json"))
 
 
-def secret_hit(word, cwd):
+def _secret_hit(word, cwd):
     """True when `word` (a path-ish argument, a flag value or a glob) names a credential store, as written or after resolving symlinks."""
     if not word:
         return False
@@ -57,6 +58,7 @@ def secret_hit(word, cwd):
         p = os.path.expanduser(cand)
         if not p.startswith("/"):
             p = os.path.join(cwd, p)
+        cands.add(os.path.realpath(p) if not re.search(r"[*?\[]", p) else p)
         p = os.path.normpath(p)
         cands.add(p)
         if not re.search(r"[*?\[]", p):
@@ -64,13 +66,17 @@ def secret_hit(word, cwd):
                 cands.add(os.path.realpath(p))
             except OSError:
                 pass
-        else:  # a glob can expand to a credential file: judge what it expands to as well as the pattern
-            try:
-                for hit in sorted(glob.glob(p))[:500]:
+        else:  # a glob can expand to a credential file: judge what it expands to (over-approximating bracket classes), fail closed on a flood
+            for pat in {p, re.sub(r"\[[^\]]*\]", "?", p)}:
+                try:
+                    hits = list(itertools.islice(glob.iglob(pat), 501))
+                except OSError:
+                    hits = []
+                if len(hits) > 500:
+                    return True
+                for hit in hits:
                     cands.add(hit)
                     cands.add(os.path.realpath(hit))
-            except OSError:
-                pass
     for c in cands:
         if _SECRET_RE.search(c):
             return True
@@ -84,8 +90,22 @@ class Reject(Exception):
     pass
 
 
+class AskNeeded(Reject):
+    """The command does something the owner can authorize but must be asked about: the hook answers ASK, never silence."""
+
+
+class SecretRead(AskNeeded):
+    """A word names a credential store (a disclosure the owner can authorize)."""
+
+
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
+
+
+def secret_hit(word, cwd):
+    if _secret_hit(word, cwd):
+        raise SecretRead(word[:40])
+    return False
 
 
 def tokenize(src):
@@ -113,6 +133,8 @@ def tokenize(src):
             flush(); i += 1; continue
         if ch == "\n":
             flush(); toks.append(("op", ";")); i += 1; continue
+        if ch == "#" and not started:
+            raise Reject("comment")
         if ch == "\\":
             if i + 1 >= n or src[i + 1] == "\n":
                 raise Reject("line continuation")
@@ -255,50 +277,72 @@ def redir_ok(fd, op, target, cwd):
 
 
 # --------------------------------------------------------------------------- command judgement
-def has_flag(args, *names, prefix=()):
-    for a in args:
-        if a in names or any(a.startswith(p) for p in prefix):
+# Every program is judged by an ALLOWLIST of flags (a denylist loses to getopt abbreviations, clustered short flags and attached values).
+# A flag that is not listed makes the whole command fall through to the normal decision.
+def flags_ok(args, short="", long_exact=(), long_prefix=(), valued=()):
+    """short: letters allowed in a cluster; valued: flags that take the next word (a short one may also carry it attached: -A3)."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
             return True
-    return False
+        if a in valued:
+            i += 2
+            continue
+        if a.startswith("--"):
+            if not (a in long_exact or (long_prefix and a.startswith(tuple(long_prefix)))):
+                return False
+        elif a.startswith("-") and len(a) > 1:
+            body = a[1:]
+            if "-" + body[0] in valued:
+                i += 1
+                continue
+            if not set(body) <= set(short):
+                return False
+        i += 1
+    return True
 
 
-def short_flags(args):
-    s = set()
-    for a in args:
-        if a.startswith("-") and not a.startswith("--") and len(a) > 1:
-            s.update(a[1:])
-    return s
+def operands(args, valued=()):
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in valued:
+            i += 2
+            continue
+        if a == "--":
+            out += args[i + 1:]
+            break
+        if not (a.startswith("-") and len(a) > 1):
+            out.append(a)
+        i += 1
+    return out
 
 
 SED_SCRIPT = re.compile(r"""^\s*(?:(?:\d+|\$|/[^/]*/)(?:,(?:\d+|\$|/[^/]*/|\+\d+))?)?!?\s*(?:[pPdq=ln]|s(.)(?:(?!\1).)*\1(?:(?!\1).)*\1[gIip0-9]*)?\s*$""")
 
 
 def ok_sed(args):
-    if any(a.startswith(("--in-place", "--file")) for a in args):
+    if not flags_ok(args, short="nEsrzu", long_exact=("--quiet", "--silent", "--regexp-extended", "--separate", "--unbuffered"),
+                    long_prefix=("--expression=",), valued=("-e", "-l")):
         return False
-    if short_flags([a for a in args if not a.startswith("--")]) & set("if"):
-        return False
-    scripts, i, files = [], 0, []
+    scripts, files, i = [], [], 0
     while i < len(args):
         a = args[i]
         if a == "-e":
-            if i + 1 >= len(args):
-                return False
             scripts.append(args[i + 1]); i += 2; continue
+        if a == "-l":
+            i += 2; continue
         if a.startswith("--expression="):
-            scripts.append(a.split("=", 1)[1]); i += 1; continue
-        if a.startswith("-") and a != "-":
-            i += 1; continue
-        files.append(a); i += 1
+            scripts.append(a.split("=", 1)[1])
+        elif not (a.startswith("-") and a != "-"):
+            files.append(a)
+        i += 1
     if not scripts:
         if not files:
             return False
         scripts = [files.pop(0)]
-    for s in scripts:
-        for piece in s.split(";"):
-            if piece.strip() and not SED_SCRIPT.match(piece):
-                return False
-    return True
+    return all(not piece.strip() or SED_SCRIPT.match(piece) for s in scripts for piece in s.split(";"))
 
 
 def ok_awk(args):
@@ -306,18 +350,16 @@ def ok_awk(args):
     while i < len(args):
         a = args[i]
         if a in ("-F", "-v"):
-            i += 2; continue
-        if a.startswith("-F") or a.startswith("-v"):
-            i += 1; continue
-        if a in ("--", ):
-            i += 1; continue
+            i += 2
+            continue
+        if (a.startswith("-F") or a.startswith("-v")) and len(a) > 2:
+            i += 1
+            continue
         if a.startswith("-"):
             return False
         prog = a
         break
-    if prog is None:
-        return False
-    return not re.search(r"system|getline|ENVIRON|\||>(?!=)|close\s*\(|fflush", prog)
+    return prog is not None and not re.search(r"system|getline|ENVIRON|\||>(?!=)|close\s*\(|fflush|@|/dev/", prog)
 
 
 def ok_find(args):
@@ -325,100 +367,86 @@ def ok_find(args):
     return not any(a in bad for a in args)
 
 
-SORT_SAFE_SHORT = set("nrukfbsdgMhVRiCc")
-SORT_SAFE_LONG = ("--numeric-sort", "--reverse", "--unique", "--key=", "--field-separator=", "--ignore-case", "--stable", "--human-numeric-sort",
-                  "--version-sort", "--month-sort", "--general-numeric-sort", "--ignore-leading-blanks", "--dictionary-order", "--check")
-
-
 def ok_sort(args):
-    """Allowlist: -o/--output (file write) and --compress-program (exec) are not in it, nor any abbreviation of them."""
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in ("-k", "-t"):
-            i += 2; continue
-        if a.startswith("--"):
-            if not a.startswith(SORT_SAFE_LONG):
-                return False
-        elif a.startswith("-") and a != "-":
-            body = a[1:]
-            if body[:1] in ("k", "t") and len(body) > 1:  # -k2,2 / -t,
-                i += 1; continue
-            if not set(body) <= SORT_SAFE_SHORT:
-                return False
-        i += 1
-    return True
+    return flags_ok(args, short="nrukfbsdgMhVRiCc0123456789,", long_exact=("--numeric-sort", "--reverse", "--unique", "--ignore-case", "--stable",
+                    "--human-numeric-sort", "--version-sort", "--month-sort", "--general-numeric-sort", "--ignore-leading-blanks", "--dictionary-order"),
+                    long_prefix=("--key=", "--field-separator="), valued=("-k", "-t"))
 
 
 def ok_uniq(args):
-    """uniq [IN [OUT]]: the second operand is an output file, and `-` counts as an operand."""
-    flags = [a for a in args if a.startswith("-") and a != "-"]
-    if any(not set(f[1:]) <= set("cduiD") for f in flags if not f.startswith("--")) or any(f.startswith("--") for f in flags):
-        return False
-    return len([a for a in args if a == "-" or not a.startswith("-")]) <= 1
-
-
-def ok_date(args):
-    return not has_flag(args, "-s", "--set", prefix=("--set=", "-s")) and all(a.startswith("-") or a.startswith("+") for a in args)
+    return flags_ok(args, short="cduiD") and len(operands(args)) + args.count("-") <= 1
 
 
 def ok_grep(args):
-    flags = short_flags([a for a in args if not a.startswith("--")])
-    if flags & set("rRdD"):
+    return flags_ok(args, short="ivnclLEFwxqsHhoaIZ0123456789", long_exact=("--line-buffered", "--ignore-case", "--invert-match", "--count", "--files-with-matches",
+                    "--no-messages", "--quiet", "--only-matching", "--word-regexp", "--fixed-strings", "--extended-regexp", "--no-filename", "--with-filename",
+                    "--line-number", "--null", "--text", "--binary-files=without-match"), long_prefix=("--color=", "--regexp=", "--max-count=", "--after-context=",
+                    "--before-context=", "--context="), valued=("-e", "-m", "-A", "-B", "-C"))
+
+
+def ok_rtk_grep(args, cwd):
+    """`rtk grep` searches recursively (hidden files skipped): flags are an allowlist and a search root must be inside a development tree."""
+    valued = ("-e", "-m", "-A", "-B", "-C", "-g", "-t", "-l", "--max-len", "--max", "--glob", "--file-type", "-T")
+    if not flags_ok(args, short="ivnclwxqsHhoFEIa0123456789", long_exact=("--context-only", "--ultra-compact", "--ignore-case", "--invert-match", "--count",
+                    "--files-with-matches", "--word-regexp", "--fixed-strings", "--line-buffered", "--no-messages", "--only-matching"),
+                    long_prefix=("--color=", "--regexp=", "--max-count=", "--max-len=", "--max=", "--glob=", "--file-type="), valued=valued):
         return False
-    return not has_flag(args, "--recursive", "--dereference-recursive", prefix=("--directories", "--devices", "--include-dir", "--exclude-dir", "--pre", "--exclude-from"))
+    ops = operands(args, valued)
+    roots = ops[1:] or ["."]  # first operand is the pattern
+    return all(root_ok(r, cwd) for r in roots)
 
 
-RG_SAFE_LONG = ("--max-len", "--max", "--context-only", "--file-type", "--glob", "--ignore-case", "--invert-match", "--count", "--line-number",
-                "--files-with-matches", "--word-regexp", "--fixed-strings", "--regexp", "--line-buffered", "--no-heading", "--with-filename",
-                "--no-filename", "--only-matching", "--max-count", "--quiet", "--context", "--before-context", "--after-context", "--type",
-                "--smart-case", "--case-sensitive", "--ultra-compact", "--extended-regexp", "--basic-regexp", "--no-messages", "--null")
+DEV_ROOTS = (os.path.join(HOME, "Bryant-Developments"), "/tmp", "/private/tmp", "/private/var/folders", os.path.join(HOME, ".cache/coding-agent-environment"),
+             os.path.join(HOME, ".cargo/shared-target"))
 
 
-def ok_rtk_grep(args):
-    for a in args:
-        if not a.startswith("-") or a == "-":
-            continue
-        if a.startswith("--"):
-            if not any(a == k or a.startswith(k + "=") for k in RG_SAFE_LONG):
-                return False
-            continue
-        if short_flags([a]) & set("rRdDuLzf"):
-            return False
-    return True
+def root_ok(path, cwd):
+    p = os.path.realpath(os.path.join(cwd, tilde(path)))
+    return any(p == r or p.startswith(r + "/") for r in DEV_ROOTS) or any(p == os.path.realpath(r) or p.startswith(os.path.realpath(r) + "/") for r in DEV_ROOTS)
 
 
-GIT_READ = {"status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "merge-base", "describe", "shortlog", "name-rev",
-            "for-each-ref", "show-ref", "remote", "branch", "tag", "stash", "worktree"}
-GIT_BAD_PREFIX = ("--ou", "--ext", "--tex", "--no-i", "--op", "-O", "--exec", "--upload", "--receive", "--git-dir", "--work-tree")
+GIT_DANGEROUS = ("output", "ext-diff", "textconv", "no-index", "open-files-in-pager", "exec", "exec-path", "upload-pack", "receive-pack", "git-dir", "work-tree",
+                 "namespace", "config-env", "paginate", "pager", "super-prefix", "attr-source")
+GIT_READ = {"status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "merge-base", "describe", "shortlog", "name-rev", "for-each-ref",
+            "show-ref", "branch", "tag", "stash", "worktree"}
+
+
+def git_option_dangerous(a):
+    if a.startswith("--"):
+        name = a[2:].split("=", 1)[0]
+        return bool(name) and any(d.startswith(name) for d in GIT_DANGEROUS)
+    return a.startswith("-O")
 
 
 def ok_git(args, cwd):
     i = 0
     while i < len(args) and args[i].startswith("-"):
-        if args[i] in ("--no-pager", "--no-optional-locks", "-P", "--no-replace-objects"):
+        if args[i] in ("--no-pager", "--no-optional-locks", "--no-replace-objects"):
             i += 1
-        elif args[i] == "-C" and i + 1 < len(args) and not secret_hit(tilde(args[i + 1]), cwd):
+        elif args[i] == "-C" and i + 1 < len(args):
+            secret_hit(tilde(args[i + 1]), cwd)
             i += 2
         else:
             return False
     if i >= len(args) or args[i] not in GIT_READ:
         return False
     verb, rest = args[i], args[i + 1:]
-    if any(a.startswith(GIT_BAD_PREFIX) for a in rest):
+    if any(git_option_dangerous(a) for a in rest):
         return False
-    if verb == "remote":
-        return rest in ([], ["-v"], ["--verbose"]) or rest[:1] in (["show"], ["get-url"])
     if verb == "branch":
-        return all(a.startswith("-") or rest[j - 1] in ("--contains", "--merged", "--no-merged", "--list", "-l") for j, a in enumerate(rest)) and not has_flag(
-            rest, "-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "-f", "--force", "--set-upstream-to", "-u", "--unset-upstream", "--edit-description")
+        return flags_ok([a for a in rest if a.startswith("-")], short="avrl", long_exact=("--list", "--show-current", "--no-color", "--all", "--remotes", "--verbose",
+                        "--contains", "--merged", "--no-merged"), long_prefix=("--sort=", "--format=", "--color=")) and not has_flag(rest, "-u", prefix=("-u",))
     if verb == "tag":
-        return not rest or rest[0] in ("-l", "--list", "-n")
+        return all(a in ("-l", "--list") or not a.startswith("-") for a in rest) and (not rest or rest[0] in ("-l", "--list"))
     if verb == "stash":
         return bool(rest) and rest[0] in ("list", "show")
     if verb == "worktree":
-        return bool(rest) and rest[0] == "list"
+        return rest == ["list"] or rest == ["list", "--porcelain"]
     return True
+
+
+def has_flag(args, *names, prefix=()):
+    return any(a in names or any(a.startswith(p) for p in prefix) for a in args)
 
 
 GH_READ = {("pr", "view"), ("pr", "list"), ("pr", "checks"), ("pr", "diff"), ("pr", "status"), ("issue", "view"), ("issue", "list"),
@@ -426,68 +454,80 @@ GH_READ = {("pr", "view"), ("pr", "list"), ("pr", "checks"), ("pr", "diff"), ("p
 
 
 def ok_gh(args):
-    pos = [a for a in args if not a.startswith("-")]
-    return len(pos) >= 2 and (pos[0], pos[1]) in GH_READ and args[:2] == pos[:2] and not has_flag(args, "--web", "-w", "--edit", "--comment", "--merge")
+    pos = [a for a in args[:2]]
+    if len(pos) < 2 or tuple(pos) not in GH_READ:
+        return False
+    # --jq/--template evaluate an expression that can read the environment; --web opens a browser; nothing else is needed for a read
+    return flags_ok(args[2:], short="LsSRlcq0123456789", long_exact=("--comments", "--name-only", "--patch", "--stat", "--watch", "--failed", "--log-failed",
+                    "--verbose", "--exit-status"), long_prefix=("--json=", "--repo=", "--limit=", "--state=", "--search=", "--author=", "--label=", "--base=", "--head=",
+                    "--branch=", "--workflow=", "--status="), valued=("--json", "--repo", "-R", "--limit", "-L", "--state", "-s", "--search", "-S", "--author",
+                    "--label", "--base", "--head", "--branch", "--workflow", "--status")) and "-q" not in args and "--jq" not in args
 
 
 def ok_cargo(args):
+    if args in (["--version"], ["-V"]):
+        return True
     if not args:
         return False
-    v = args[0]
-    if v in ("--version", "-V", "locate-project"):
-        return True
+    v, rest = args[0], args[1:]
     if v == "metadata":
-        return has_flag(args, "--offline", "--frozen")
+        return "--offline" in rest and flags_ok(rest, long_exact=("--offline", "--no-deps", "--frozen", "--locked"), long_prefix=("--format-version=",),
+                                                 valued=("--format-version",))
     if v == "tree":
-        return has_flag(args, "--offline", "--frozen")
-    if v in ("test", "check", "build", "clippy"):
-        return not has_flag(args, "--fix", "--target-dir", "--config", "--manifest-path", prefix=("--target-dir=", "--config=", "--manifest-path="))
-    if v == "fmt":
-        return has_flag(args, "--check")
-    if v == "nextest":
-        return len(args) > 1 and args[1] == "run"
+        return "--offline" in rest and flags_ok(rest, short="eid", long_exact=("--offline", "--frozen", "--locked", "--workspace"), long_prefix=("--depth=",),
+                                                 valued=("--depth", "-p", "--package"))
     return False
 
 
-CHECKOUT_RE = re.compile(r"^" + re.escape(HOME) + r"/Bryant-Developments/coding-agent-environment[^/]*/scripts/")
-TRUSTED_SCRIPT_ARGS = {"disk-admission.py": ({"status"}, {"queue status"}), "memory-admission.py": (set(), {"check"}), "classify-step.py": (set(), set())}
+CHECKOUT_RE = re.compile(r"^" + re.escape(HOME) + r"/Bryant-Developments/coding-agent-environment(-main-view)?/scripts/")
 
 
 def ok_script(args, cwd):
-    """python3 <trusted scripts/X.py> <read-only subcommand>: only the scheduler/admission status checks, from a coding-agent-environment checkout."""
+    """python3 <scripts/X.py> from the owner's two stable coding-agent-environment checkouts, read-only subcommands only."""
     if not args or args[0].startswith("-"):
         return False
     path = os.path.realpath(os.path.join(cwd, tilde(args[0])))
     if not CHECKOUT_RE.match(path) or not os.path.isfile(path):
         return False
-    name = os.path.basename(path)
-    if name not in TRUSTED_SCRIPT_ARGS:
-        return False
     rest = [a for a in args[1:] if a != "--json"]
     if rest and rest[-1] == ".":  # the rtk rewrite appends a bare ` .` to some commands (measured with the host matrix); it names nothing here
         rest = rest[:-1]
+    name = os.path.basename(path)
     if name == "disk-admission.py":
         return rest in (["status"], ["queue", "status"])
     if name == "memory-admission.py":
-        return bool(rest) and rest[0] == "check"
+        return len(rest) in (1, 3) and rest[0] == "check" and (len(rest) == 1 or (rest[1] == "--weight" and rest[2] in ("light", "heavy")))
     return False
 
 
 def ok_python(args, cwd):
-    if args == ["--version"] or args == ["-V"]:
+    if args in (["--version"], ["-V"]):
         return True
-    if args[:2] == ["-m", "pytest"]:
-        return not has_flag(args, "-p", "-c", "--confcutdir", "--rootdir", prefix=("-p", "-c", "--confcutdir=", "--rootdir=", "--basetemp="))
     return ok_script(args, cwd)
 
 
-def ok_pytest(args):
-    return not has_flag(args, "-p", "-c", "--confcutdir", "--rootdir", prefix=("-p", "-c", "--confcutdir=", "--rootdir=", "--basetemp="))
+def ok_jq(args):
+    if not flags_ok(args, short="rcCeSMn", long_exact=("--raw-output", "--compact-output", "--exit-status", "--sort-keys", "--null-input", "--slurp"), valued=("--arg",)):
+        return False
+    return not any(re.search(r"\benv\b|\$ENV|input|import|include|\$__|debug|stderr|halt", a) for a in args if not a.startswith("-"))
 
 
-SIMPLE_READ = {"cat", "head", "tail", "wc", "nl", "cut", "tr", "echo", "printf", "df", "du", "ls", "stat", "file", "pwd", "basename", "dirname",
-               "realpath", "readlink", "break", "continue", "diff", "cmp", "shasum", "md5", "column", "jq", "sleep", "true", "false", "test", "[", "uname", "whoami",
-               "uptime", "vm_stat", "tree", "rev", "paste", "comm", "expand", "fold", "od", "seq", "which"}
+def ok_diff(args):
+    return flags_ok(args, short="uqswbBiy0123456789", long_exact=("--brief", "--strip-trailing-cr", "--ignore-space-change", "--ignore-all-space"),
+                    long_prefix=("--unified=",), valued=("-U",))
+
+
+def ok_tree(args):
+    return flags_ok(args, short="adfFCniD", long_exact=("--noreport",), valued=("-L", "-I", "-P"))
+
+
+SIMPLE_FLAGS = {  # program -> (short letters, valued flags)
+    "cat": ("nbsvAeEtTu", ()), "head": ("nqv0123456789", ("-n", "-c")), "tail": ("nfFqv0123456789", ("-n", "-c")), "wc": ("lwcmL", ()),
+    "cut": ("sn", ("-c", "-d", "-f", "-b")), "tr": ("dcsC", ()), "echo": ("neE", ()), "printf": ("", ()), "df": ("ghkHPTilm", ()), "du": ("ahksxcdLH0123456789", ("-d",)),
+    "ls": ("alhtrSR1FdGisLpAkn", ()), "stat": ("xnlstFqLr", ("-f", "-c", "-t")), "pwd": ("LP", ()), "basename": ("", ()), "dirname": ("", ()), "realpath": ("q", ()),
+    "readlink": ("fn", ()), "cmp": ("ls", ()), "sleep": ("", ()), "true": ("", ()), "false": ("", ()), "uname": ("asmnrv", ()), "whoami": ("", ()), "uptime": ("", ()),
+    "vm_stat": ("", ()), "break": ("", ()), "continue": ("", ()),
+}
 RTK_NATIVE = {"ls", "tree", "find", "wc", "df", "du", "diff", "cat", "head", "tail"}
 
 
@@ -499,23 +539,23 @@ def judge(argv, cwd, state):
     if "/" in prog:
         return False
     for a in args:
-        if secret_hit(tilde(a), cwd):
-            return False
+        secret_hit(tilde(a), cwd)
+        if a.startswith("-") and not a.startswith("--") and len(a) > 2:
+            secret_hit(tilde(a[2:]), cwd)  # an attached short-option value: -f.env
     if prog == "rtk":
         if not args:
             return False
         sub, rest = args[0], args[1:]
         if sub == "read":
-            return bool(rest) and not has_flag(rest, "--skip-env")
+            return bool(operands(rest, ("-l", "--level", "-m", "--max-lines", "--tail-lines"))) and flags_ok(
+                rest, short="n", long_exact=("--line-numbers", "--ultra-compact"), valued=("-l", "--level", "-m", "--max-lines", "--tail-lines"))
         if sub == "grep":
-            return ok_rtk_grep(rest)
-        if sub in ("git", "gh"):
-            return judge([sub] + rest, cwd, state)
-        if sub in RTK_NATIVE:
+            return ok_rtk_grep(rest, cwd)
+        if sub in ("git", "gh") or sub in RTK_NATIVE:
             return judge([sub] + rest, cwd, state)
         return False
     if prog == "cd":
-        return len(args) <= 1 and (not args or not secret_hit(tilde(args[0]), cwd))
+        return len(args) <= 1 and (not args or args[0] != "-")
     if prog == "sed":
         return ok_sed(args)
     if prog in ("awk", "gawk"):
@@ -529,7 +569,7 @@ def judge(argv, cwd, state):
     if prog == "uniq":
         return ok_uniq(args)
     if prog == "date":
-        return ok_date(args)
+        return all(a == "-u" or a.startswith("+") for a in args)
     if prog == "git":
         return ok_git(args, cwd)
     if prog == "gh":
@@ -538,15 +578,42 @@ def judge(argv, cwd, state):
         return ok_cargo(args)
     if prog in ("python3", "python"):
         return ok_python(args, cwd)
-    if prog == "pytest":
-        return ok_pytest(args)
-    if prog == "jq" and any(re.search(r"\benv\b|\$ENV|input_filename|\$__loc__", a) for a in args):
-        return False
-    if prog in SIMPLE_READ:
-        if prog == "tree" and has_flag(args, "-o"):
-            return False
+    if prog == "jq":
+        return ok_jq(args)
+    if prog == "diff":
+        return ok_diff(args)
+    if prog == "tree":
+        return ok_tree(args)
+    if prog in ("test", "["):
         return True
+    if prog in ("echo", "printf"):  # prints its operands; `echo ---` is text, not an option
+        return True
+    if prog in SIMPLE_FLAGS:
+        short, valued = SIMPLE_FLAGS[prog]
+        return flags_ok(args, short=short, valued=valued)
     return False
+
+
+PROTECTED_VAR = re.compile(r"^(HOME|PATH|IFS|SHELL|ENV|BASH_ENV|PS[0-9]|PROMPT_COMMAND|CDPATH|GLOBIGNORE|GIT_|LD_|DYLD_|PYTHON|PYTEST_|CARGO_|RUST|RTK_|NODE_|NPM_|PAGER|EDITOR|VISUAL|LESS|TMPDIR|XDG_|LC_|LANG|OLDPWD|PWD)")
+KILLERS = {"pkill", "killall", "kill"}
+WORKTREE_MUTATING = {"add", "remove", "prune", "move", "lock", "unlock", "repair"}
+
+
+def danger(words):
+    """Operations the owner can authorize but must be asked about, found in any stage whatever the other stages are."""
+    prog, args = words[0], words[1:]
+    while prog in ("rtk", "proxy", "command", "nohup", "time", "sudo", "env") and args:
+        prog, args = args[0], args[1:]
+    if prog in KILLERS:
+        raise AskNeeded("process-kill")
+    if prog == "rm" and any(a in ("-r", "-R", "--recursive", "-f", "--force") or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("rRf")) for a in args):
+        raise AskNeeded("recursive-or-forced-delete")
+    if prog == "git":
+        i = 0
+        while i < len(args) and args[i].startswith("-"):
+            i += 2 if args[i] in ("-C", "-c") else 1
+        if i + 1 < len(args) and args[i] == "worktree" and args[i + 1] in WORKTREE_MUTATING:
+            raise AskNeeded("worktree-change")
 
 
 STRUCT_PREFIX = {"until", "while", "if", "elif", "then", "else", "do", "!"}
@@ -556,7 +623,7 @@ def classify_command(src, cwd):
     """-> (True, reason) when every stage of `src` is read-only, else (False, why)."""
     try:
         toks = tokenize(src)
-        vars_, loopvars, cur = {}, set(), cwd
+        vars_, loopvars, cur, failed = {}, set(), cwd, None
         seg, segs = [], []
         for t in toks + [("op", ";")]:
             if t[0] == "op":
@@ -603,8 +670,8 @@ def classify_command(src, cwd):
             if all(ASSIGN.match(w) for w in seg_words):
                 for w in seg_words:
                     m = ASSIGN.match(w)
-                    if m.group(1) in loopvars:
-                        return False, "assign loopvar"
+                    if m.group(1) in loopvars or m.group(1) in os.environ or PROTECTED_VAR.match(m.group(1)):
+                        return False, "assign to an existing or protected variable"
                     vars_[m.group(1)] = tilde(m.group(2))
                 continue
             if ASSIGN.match(first):
@@ -616,18 +683,26 @@ def classify_command(src, cwd):
                 cur = nxt
                 stages += 1
                 continue
-            if not judge(seg_words, cur, vars_):
-                return False, "stage: " + first
+            danger(seg_words)
+            if failed is None and not judge(seg_words, cur, vars_):
+                failed = (False, "stage: " + first)
+                continue
             stages += 1
             if "do" in [expand_word(w, vars_) for w in words[:1]]:
                 pass
         # an until/while body is introduced by `do` and closed by `done`; count `do` words conservatively
         do_count = sum(1 for seg in segs if seg and seg[0][0] == "word" and seg[0][1] == [("lit", "do")])
+        if failed:
+            return failed
         if closed != do_count or fis != ifs:
             return False, "unbalanced"
         if stages == 0:
             return False, "empty"
         return True, "readonly-pipeline"
+    except SecretRead:
+        return "ask", "credential-path"
+    except AskNeeded as e:
+        return "ask", str(e)
     except Reject as e:
         return False, "reject: %s" % e
     except Exception as e:  # noqa: BLE001 - never raise out of a permission hook
@@ -643,7 +718,12 @@ READONLY_AGENTS = {"Explore", "Plan", "claude-code-guide", "caveman:cavecrew-inv
 DECLARES_READONLY = re.compile(r"^\s*(\*\*)?(independent\s+)?read[- ]only\b", re.I)
 
 
+AGENT_KEYS = {"description", "prompt", "subagent_type", "name", "run_in_background"}
+
+
 def classify_agent(tin):
+    if not set(tin) <= AGENT_KEYS:  # mode, isolation, model overrides and anything else this hook has not judged
+        return False, "agent-extra-fields"
     st = (tin.get("subagent_type") or "").strip()
     if st in READONLY_AGENTS:
         return True, "readonly-agent-type"
@@ -659,8 +739,7 @@ def decide(event):
         cmd = tin.get("command")
         if not isinstance(cmd, str) or not cmd.strip():
             return None, "no-command"
-        ok, why = classify_command(cmd, cwd)
-        return ok, why
+        return classify_command(cmd, cwd)
     if tool in ("Agent", "Task"):
         return classify_agent(tin)
     return None, "tool-not-covered"
@@ -671,7 +750,7 @@ def log(event, ok, why):
         os.makedirs(os.path.dirname(LOG), exist_ok=True)
         tin = event.get("tool_input") or {}
         basis = tin.get("command") or tin.get("prompt") or ""
-        rec = {"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tool": event.get("tool_name"), "decision": "allow" if ok else "fallthrough",
+        rec = {"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tool": event.get("tool_name"), "decision": ok if ok == "ask" else ("allow" if ok else "fallthrough"),
                "why": why, "sid": str(event.get("session_id", ""))[:8], "sha": hashlib.sha256(str(basis).encode()).hexdigest()[:12]}
         with open(LOG, "a") as fh:
             fh.write(json.dumps(rec) + "\n")
@@ -688,7 +767,10 @@ def main():
     if ok is None:
         return 0
     log(event, ok, why)
-    if ok:
+    if ok == "ask":
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
+                                                  "permissionDecisionReason": "this command reads a credential or key store; approve only if intended"}}))
+    elif ok:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
                                                   "permissionDecisionReason": "routine read-only operation (%s)" % why}}))
     return 0
