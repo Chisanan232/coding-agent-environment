@@ -117,6 +117,7 @@ jobs:
           python3 tests/test-full-parity-inventory.py
           python3 tests/test-full-parity-install.py
           python3 tests/test-codex-routing.py
+          python3 tests/test-frontend-skills.py
           python3 tests/test-visual-skills.py
           python3 tests/test-ui-ux-policy.py
           python3 tests/test-storage-integration.py

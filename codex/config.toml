@@ -43,6 +43,11 @@ enabled = true
 [plugins."build-web-apps@openai-curated"]
 enabled = true
 
+# Keep engineering and browser testing from this plugin available.
+[[skills.config]]
+name = "build-web-apps:frontend-app-builder"
+enabled = false
+
 [plugins."github@openai-curated"]
 enabled = true
 

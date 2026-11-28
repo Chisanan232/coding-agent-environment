@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Install the pinned Archify and Visual Explainer skill trees."""
+"""Reconcile pinned visual skills for Claude Code and Codex."""
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import stat
 import subprocess
@@ -122,7 +124,7 @@ def load_manifest(root: Path) -> dict[str, dict[str, Any]]:
 def validate_paths(paths: list[str]) -> None:
     for value in paths:
         path = PurePosixPath(value)
-        if path.is_absolute() or not path.parts or any(part in ("", ".", "..") for part in path.parts):
+        if path.is_absolute() or not path.parts or any(part in ("", ".", "..", ".git") for part in value.split("/")):
             raise VisualSkillsError(f"Unsafe package path: {value}")
 
 
@@ -152,37 +154,38 @@ def fetch_snapshot(name: str, spec: dict[str, Any], snapshots: Path) -> Path:
     with tempfile.TemporaryDirectory(prefix=f".{name}-fetch-", dir=snapshots) as temporary:
         temp_root = Path(temporary)
         checkout = temp_root / "checkout"
-        run_git(["clone", "--quiet", "--no-checkout", spec["repository"], str(checkout)])
-        tagged_revision = run_git(["rev-parse", f"refs/tags/{spec['tag']}^{{commit}}"], cwd=checkout)
-        if tagged_revision.lower() != spec["revision"].lower():
-            raise VisualSkillsError(f"Tag {spec['tag']} does not resolve to pinned revision for {name}.")
-        run_git(["checkout", "--quiet", "--detach", spec["revision"]], cwd=checkout)
-        actual_head = run_git(["rev-parse", "HEAD"], cwd=checkout)
-        if actual_head.lower() != spec["revision"].lower():
-            raise VisualSkillsError(f"Checkout did not match pinned revision for {name}.")
+        run_git(["init", "--quiet", "--bare", str(checkout)])
+        ref = f"refs/tags/{spec['tag']}" if spec.get("tag") else spec["revision"]
+        run_git(["remote", "add", "origin", spec["repository"]], cwd=checkout)
+        fetch = ["fetch", "--quiet", "--depth=1", "--no-tags"]
+        if not spec.get("tag"):
+            # The creative collection contains large demo assets outside the reviewed roots.
+            run_git(["config", "remote.origin.promisor", "true"], cwd=checkout)
+            run_git(["config", "remote.origin.partialclonefilter", "blob:none"], cwd=checkout)
+            fetch.append("--filter=blob:none")
+        run_git([*fetch, "origin", ref], cwd=checkout)
+        revision = run_git(["rev-parse", "FETCH_HEAD^{commit}"], cwd=checkout)
+        if revision != spec["revision"]:
+            raise VisualSkillsError(f"Fetch does not resolve to pinned revision for {name}.")
         tree = temp_root / "snapshot"
         tree.mkdir()
-        for relative in paths:
-            source = checkout / relative
-            if source.is_symlink() or not source.exists():
-                raise VisualSkillsError(f"Pinned source path is missing or symlinked: {name}/{relative}")
-            if source.is_dir():
-                for current, dirs, files in os.walk(source, followlinks=False):
-                    current_path = Path(current)
-                    for directory in list(dirs):
-                        child = current_path / directory
-                        if child.is_symlink():
-                            raise VisualSkillsError(f"Pinned source contains a symlink: {name}/{child.relative_to(checkout)}")
-                    for file_name in files:
-                        child = current_path / file_name
-                        if child.is_symlink() or not child.is_file():
-                            raise VisualSkillsError(f"Pinned source contains an unsupported file: {name}/{child.relative_to(checkout)}")
-                shutil.copytree(source, tree / relative, symlinks=False)
-            elif source.is_file():
-                (tree / relative).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, tree / relative)
-            else:
-                raise VisualSkillsError(f"Pinned source path is not a file or directory: {name}/{relative}")
+        # Read Git blobs without checking out filters, hooks or submodules.
+        listing = run_git(["ls-tree", "-rz", revision, "--", *paths], cwd=checkout)
+        for entry in listing.rstrip("\0").split("\0"):
+            if not entry:
+                continue
+            header, relative = entry.split("\t", 1)
+            mode, kind, oid = header.split()
+            validate_paths([relative])
+            if kind != "blob" or mode not in ("100644", "100755"):
+                raise VisualSkillsError(f"Pinned source contains an unsupported file: {name}/{relative}")
+            target_file = tree / relative
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            with target_file.open("xb") as output:
+                subprocess.run(["git", "cat-file", "blob", oid], cwd=checkout, stdout=output, check=True)
+            target_file.chmod(0o755 if mode == "100755" else 0o644)
+        if any(not (tree / root).exists() for root in paths):
+            raise VisualSkillsError(f"Missing consumed root for {name}.")
         actual = digest_tree(tree)
         if actual != expected:
             raise VisualSkillsError(f"Fetched {name} tree digest mismatch (expected {expected}, found {actual}).")
@@ -289,7 +292,7 @@ def verify_plugin_content(plugin: dict[str, Any], snapshot: Path) -> bool:
 
 def receipt_for(path: Path) -> dict[str, Any] | None:
     data = read_json(path, None)
-    if data is None:
+    if data is None and not path.exists():
         return None
     if not isinstance(data, dict) or data.get("owner") != OWNER or data.get("version") != 1:
         raise VisualSkillsError(f"Visual skill receipt is not owned by this installer: {path}")
@@ -304,6 +307,131 @@ def run_claude(args: list[str]) -> None:
         raise VisualSkillsError(f"Claude CLI failed: claude {' '.join(args)} (exit {result.returncode}).{suffix}")
 
 
+def frontend_catalog(root: Path) -> dict:
+    manifest = read_json(root / 'codex/subtraction-skills.json', {})
+    catalog = manifest['visuals']['frontend']['packages']
+    for name, spec in catalog.items():
+        if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', name):
+            raise VisualSkillsError('Invalid frontend skill name.')
+        if not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+\.git', spec['repository']):
+            raise VisualSkillsError(f'Invalid public GitHub source for {name}.')
+        validate_paths(spec['paths'] + [spec['skill_path']])
+        if (spec['state'] not in {'active', 'quarantined'}
+                or not re.fullmatch(r'[0-9a-f]{40}', spec['revision'])
+                or not re.fullmatch(r'sha256:[0-9a-f]{64}', spec['integrity'])
+                or Path(spec['skill_path']).name != name
+                or not any(p in {spec['skill_path'], spec['skill_path'] + '/SKILL.md'} for p in spec['paths'])):
+            raise VisualSkillsError(f'Invalid frontend pin or state for {name}.')
+    return catalog
+
+
+def frontend_target(base: Path, home: Path, name: str, record: dict, verify: bool, allow_damaged: bool = False) -> Path:
+    revision, integrity, leaf = (record[key] for key in ('revision', 'integrity', 'skill_path'))
+    validate_paths([leaf])
+    if (not re.fullmatch(r'[a-f0-9]{40}', revision) or Path(leaf).name != name
+            or not re.fullmatch(r'sha256:[a-f0-9]{64}', integrity)):
+        raise VisualSkillsError(f'Malformed frontend receipt for {name}.')
+    snapshot = base / name / revision
+    reject_symlink_chain(snapshot / leaf, home)
+    if not allow_damaged and (verify or snapshot.exists()):
+        if digest_tree(snapshot) != integrity[7:] or not (snapshot / leaf / 'SKILL.md').is_file():
+            raise VisualSkillsError(f'Frontend snapshot integrity failure for {name}.')
+    return snapshot / leaf
+
+
+def frontend_skills(args: argparse.Namespace, home: Path, base: Path) -> int:
+    catalog = frontend_catalog(args.repo_root)
+    receipt_path = base / 'receipt.json'
+    reject_symlink_chain(receipt_path, home)
+    if args.check or args.dry_run:
+        return reconcile_frontend(args, home, base, catalog, receipt_path)
+    base.mkdir(parents=True, exist_ok=True)
+    lock_path = base / '.apply.lock'
+    reject_symlink_chain(lock_path, home)
+    with lock_path.open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise VisualSkillsError('Another frontend installation holds the lock.') from exc
+        return reconcile_frontend(args, home, base, catalog, receipt_path)
+
+
+def reconcile_frontend(args: argparse.Namespace, home: Path, base: Path, catalog: dict, receipt_path: Path) -> int:
+    initial_bytes = receipt_path.read_bytes() if receipt_path.exists() else None
+    receipt = receipt_for(receipt_path) or {'owner': OWNER, 'version': 1, 'active': {}}
+    if not isinstance(receipt.get('active'), dict):
+        raise VisualSkillsError('Malformed frontend ownership receipt.')
+    current = receipt['active']
+    pending = receipt.get('pending')
+    desired = {name: {key: spec[key] for key in ('revision', 'integrity', 'skill_path')}
+               for name, spec in catalog.items() if spec['state'] == 'active'}
+    if args.rollback:
+        desired = receipt.get('previous', current)
+    if pending is not None and pending != desired:
+        raise VisualSkillsError('Finish the pending operation with its original manifest and mode.')
+    recorded = [current, pending or {}]
+    for group in [*recorded, desired]:
+        if not isinstance(group, dict) or group.keys() - catalog.keys():
+            raise VisualSkillsError('Unknown frontend receipt entry. Keep removed packages declared as quarantined.')
+    drift = pending is not None or current != desired
+    changes = []
+    for name in catalog:
+        owned = {frontend_target(base, home, name, group[name], True, allow_damaged=args.rollback)
+                 for group in recorded if name in group}
+        wanted = frontend_target(base, home, name, desired[name], args.rollback) if name in desired else None
+        for host in ('.agents', '.claude'):
+            target = home / host / 'skills' / name
+            reject_symlink_chain(target.parent, home)
+            before = owned_link_state(target, owned)
+            if before != wanted:
+                changes.append((target, owned, before, wanted))
+                drift = True
+            print(f"{'DIFFERS' if before != wanted else 'IDENTICAL'} {host}/skills/{name}")
+        if os.path.lexists(home / '.codex/skills' / name):
+            raise VisualSkillsError(f'Duplicate unmanaged Codex skill for {name}.')
+    if args.check or args.dry_run or not drift:
+        print(f'Managed frontend skill drift: {int(drift)}')
+        return int(args.check and drift)
+    for name in desired:
+        if not args.rollback:
+            fetch_snapshot(name, catalog[name], base)
+        frontend_target(base, home, name, desired[name], True)
+    # Retain the pre-change pins in a private journal before switching either host.
+    journal = {**receipt, 'pending': desired}
+    reject_symlink_chain(receipt_path, home)
+    if (receipt_path.read_bytes() if receipt_path.exists() else None) != initial_bytes:
+        raise VisualSkillsError('Frontend ownership receipt changed while staging.')
+    atomic_json(receipt_path, journal)
+    for target, owned, before, wanted in changes:
+        reject_symlink_chain(target.parent, home)
+        if owned_link_state(target, owned) != before:
+            raise VisualSkillsError('Frontend target changed while staging. Preserving it.')
+        if wanted is None:
+            target.unlink()  # Only the verified, receipt-owned link.
+        elif before is None:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(wanted)
+        else:
+            set_link(target, wanted)
+    for name in catalog:
+        wanted = frontend_target(base, home, name, desired[name], True) if name in desired else None
+        for host in ('.agents', '.claude'):
+            target = home / host / 'skills' / name
+            if owned_link_state(target, {wanted} if wanted else set()) != wanted:
+                raise VisualSkillsError(f'Frontend read-back failed for {name}.')
+        if os.path.lexists(home / '.codex/skills' / name):
+            raise VisualSkillsError(f'Duplicate unmanaged Codex skill for {name}.')
+    reject_symlink_chain(receipt_path, home)
+    if read_json(receipt_path, None) != journal:
+        raise VisualSkillsError('Frontend ownership journal changed during activation.')
+    final = {'owner': OWNER, 'version': 1, 'active': desired}
+    if not args.rollback:
+        final['previous'] = current if current != desired else receipt.get('previous', current)
+    atomic_json(receipt_path, final)
+    print('Verified frontend snapshots and both host entry points.')
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
@@ -311,15 +439,21 @@ def main() -> int:
     mode.add_argument('--check', action='store_true')
     parser.add_argument('--repo-root', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--print-digest', type=Path)
+    parser.add_argument('--frontend', action='store_true')
+    mode.add_argument('--rollback', action='store_true')
     args = parser.parse_args()
     if args.print_digest:
         print(digest_tree(args.print_digest))
         return 0
-    specs = load_manifest(args.repo_root)
     home = Path(os.environ.get('CODING_AGENT_SYNC_HOME', str(Path.home()))).absolute()
     global _CLAUDE_ENV
     _CLAUDE_ENV = claude_env(home)
     base = home / '.local/share/coding-agent-environment/visual-skills'
+    if args.frontend:
+        return frontend_skills(args, home, base / 'frontend')
+    if args.rollback:
+        parser.error('--rollback requires --frontend')
+    specs = load_manifest(args.repo_root)
     receipt_path = base / 'receipt.json'
     reject_symlink_chain(receipt_path, home)
     reject_symlink_chain(home / '.claude', home)
@@ -424,7 +558,6 @@ def main() -> int:
         print('Managed visual skill drift: 0')
         return 0
     # Serialize our reconciler; native registries are independently re-read after fetching.
-    import fcntl
     base.mkdir(parents=True, exist_ok=True)
     lock_path = base / '.apply.lock'
     reject_symlink_chain(lock_path, home)

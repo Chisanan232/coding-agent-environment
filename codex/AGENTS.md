@@ -49,6 +49,9 @@ Campaign completion (mission and stop condition; detailed loop in `decision-dele
 - Do not re-ask for already-authorized work. Ask only for material product or scope decisions, actions outside authorization, or unavoidable credential or host interaction, with the proposal, recommendation, impact and minimal action, and keep working.
 <!-- coding-agent-environment:baseline:campaign-completion:end -->
 
+For frontend design, use the UI/UX policy bundled with `acceptance-validation`
+for task routing and browser evidence. Load only the selected primary.
+
 Create only what has a current need. Search before creating; reuse or extend
 only matching semantic responsibilities, and reference canonical truth before
 repeating it. Avoid speculative abstractions; deletion/consolidation can improve

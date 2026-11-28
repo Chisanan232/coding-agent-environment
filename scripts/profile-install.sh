@@ -16,6 +16,7 @@
 #
 # Usage:
 #   ./scripts/profile-install.sh [--dry-run]
+#   ./scripts/profile-install.sh --frontend [--dry-run | --check | --rollback]
 #   ./scripts/profile-install.sh --visuals [--dry-run | --check]
 #   ./scripts/profile-install.sh --global [--dry-run | --check]
 #   ./scripts/profile-install.sh --claude-policy [--dry-run | --check]   (managed Claude policy block only)
@@ -35,6 +36,9 @@ fi
 if [[ "${1:-}" == "--routing" ]]; then
     shift
     exec python3 "$REPO_ROOT/scripts/codex-routing.py" "$@"
+fi
+if [[ "${1:-}" == "--frontend" ]]; then
+    exec python3 "$REPO_ROOT/scripts/visual-skills.py" "$@"
 fi
 if [[ "${1:-}" == "--visuals" ]]; then
     shift

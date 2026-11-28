@@ -18,7 +18,7 @@ class FullParity(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name) / 'home'
         self.repo = Path(self.temp.name) / 'repo'
-        for name in ['.claude', 'codex', 'scripts']:
+        for name in ['.claude', 'codex', 'scripts', 'docs']:
             shutil.copytree(ROOT / name, self.repo / name)
         self.env = dict(os.environ, CODING_AGENT_SYNC_HOME=str(self.home))
         manifest_path = self.repo / 'codex/subtraction-skills.json'
@@ -203,7 +203,6 @@ class FullParity(unittest.TestCase):
         cooldown.unlink()
         self.assertEqual(quality(warning, 1).returncode, 1)
     def test_codex_tree_excludes_host_specific_files_and_reports_stale_ones(self):
-        shutil.copytree(ROOT / 'docs', self.repo / 'docs')
         host_specific = ['engineering-runtime/references/claude-runtime.md',
                          'ci-failure-triage/references/claude-ci-triage.md',
                          'architecture-design/references/model-routing-and-delegation.md',
@@ -315,7 +314,6 @@ class FullParity(unittest.TestCase):
         return found
 
     def test_codex_install_has_no_dangling_relative_links_and_the_scan_detects_one(self):
-        shutil.copytree(ROOT / 'docs', self.repo / 'docs')
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(self.dangling_codex_links(), [])
         # Negative control: a hard link to a host-specific file outside any claude-only span.

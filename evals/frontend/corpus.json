@@ -1,0 +1,32 @@
+{
+  "protocol": 1,
+  "shared": "Build just the requested surface as one complete HTML document with embedded CSS and any necessary vanilla JS. Return only HTML, within 6500 UTF-8 bytes. Use semantic landmarks, visible keyboard focus, readable contrast and a reduced-motion alternative. No external URLs, fonts, libraries, storage, downloads or services. Render at 375, 768 and 1280 CSS pixels. Use only the supplied copy and data. No surrounding explanation.",
+  "tasks": {
+    "brand": {
+      "brief": "Create the first viewport of a premium print studio called Fold Archive. Sell a single limited-edition coastal print. Required copy: Fold Archive, Low Tide, Edition of 30, View edition. Use the supplied reference.svg as the actual print artwork, visible on first paint. Its landscape contains a pale sky above curved rust and charcoal strata, with quiet space on the left. View edition must open and close visible details reading Pigment on cotton, 50 × 70 cm. Make the press identity, the print and the action easy to distinguish.",
+      "action": "View edition",
+      "after": "Pigment on cotton"
+    },
+    "dashboard": {
+      "brief": "Build a dispatch desk for one operations lead. Use the reference palette of ink, warm paper and rust for exceptions. Heading: Dispatch desk. Show Access Road (On time, 08:30), Mill Lane (Delayed, 08:45), East Dock (On time, 09:10). Use a keyboard-operable Delayed only toggle to show just Mill Lane, then restore all rows. Preserve the row labels and times on mobile.",
+      "action": "Delayed only",
+      "after": "Mill Lane",
+      "hiddenAfter": ["East Dock", "Access Road"]
+    },
+    "hero": {
+      "brief": "Design a single poster-viewer hero for Low Tide. Display reference.svg as supplied. Reveal the two-word noninteractive heading Low Tide once on entry, keeping both words legible with reduced motion or JavaScript disabled. A button labeled Detail view toggles a close crop and reveals Pigment detail, with an immediate equivalent under reduced motion. Maintain the print title, button and clear visual hierarchy on each viewport.",
+      "action": "Detail view",
+      "after": "Pigment detail"
+    },
+    "motion": {
+      "brief": "Build a two-scene exhibition transition for the reference.svg landscape. Scene one: Exposure. Scene two: Print. The button Next scene must advance and return. Transition the artwork crop and scene label over 400 ms. The reduced-motion version must update immediately. Maintain perceivable scene state throughout the transition.",
+      "action": "Next scene",
+      "after": "Print"
+    },
+    "mobile": {
+      "brief": "Build a mobile-first pickup scheduler for Fold Archive. Show Saturday, 10:00 and Saturday, 11:30 as radio options, with 10:00 selected by default. A Confirm pickup button shows Pickup confirmed and the selected time. Use the warm paper, ink and rust reference palette. One thumb should reach the primary action at 375 px.",
+      "action": "Confirm pickup",
+      "after": "Pickup confirmed"
+    }
+  }
+}

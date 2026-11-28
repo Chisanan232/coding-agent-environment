@@ -56,6 +56,12 @@
       "references/RTK.md": ".claude/RTK.md",
       "references/storage-core.json": "codex/storage-core.json",
       "scripts/closeout.py": ".claude/skills/engineering-runtime/scripts/closeout.py"
+    },
+    "acceptance-validation": {
+      "references/UI-UX-POLICY.md": "docs/UI-UX-POLICY.md",
+      "references/templates/DESIGN-BRIEF.md": "docs/templates/DESIGN-BRIEF.md",
+      "references/templates/DESIGN.md": "docs/templates/DESIGN.md",
+      "references/templates/UI-QA-CHECKLIST.md": "docs/templates/UI-QA-CHECKLIST.md"
     }
   },
   "profiles": [

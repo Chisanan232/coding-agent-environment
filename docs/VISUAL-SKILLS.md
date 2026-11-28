@@ -170,3 +170,24 @@ regressions, secret scanning, repeat apply, and managed drift checks passed.
 Claude model execution remained externally blocked by the weekly quota until
 2026-10-08 02:00 Asia/Taipei; native discovery and renderer evidence are separate
 from that unavailable model-session check.
+
+## Frontend design skills
+
+The separate `visuals.frontend` section in the same external-source manifest controls design skills. Each entry names the role, activation state, upstream commit, license, consumed paths, skill directory and complete-tree digest. The `--frontend` selection operates independently of the diagram packages, which have different native host layouts. Both selections use the same Git snapshot and integrity verifier. There is no requirement to install a whole marketplace.
+
+```sh
+scripts/profile-install.sh --frontend --dry-run
+scripts/profile-install.sh --frontend
+scripts/sync-check.sh --frontend
+scripts/profile-install.sh --frontend --rollback
+```
+
+Set `CODING_AGENT_SYNC_HOME` to a disposable directory for acceptance. If set, host-specific home overrides must point into that same home. Dry-run and check read only local state. Apply fetches the pinned Git objects for a missing active snapshot and verifies its digest before linking the same skill leaf into the Claude and shared agent skill directories. A quarantined entry has no managed discovery link. Changing an entry to quarantined removes only links recorded in the installer receipt and retains the verified snapshot. A same-named foreign entry blocks reconciliation.
+
+The private frontend receipt under the visual snapshot store records the previous active pins before the links change. Reapply the same manifest after an interruption. For an interrupted rollback, repeat rollback. Rollback verifies the previous snapshots offline and restores the preceding link set, including an empty first-install baseline. A check against a newer manifest can legitimately show drift afterward. To roll back beyond one successful pin change, apply the reviewed earlier manifest, retaining quarantined declarations for retired names. Third-party bodies and receipts stay outside the repository.
+
+Use a fresh Claude SDK command catalog or CLI session and a fresh Codex app-server `skills/list` to verify native discovery. Keep plugin enablement, skill discovery, invocation and rendered evidence separate. Use supported host controls for plugin overlaps. Record the prior setting before changing it and restore only that setting on rollback. The portable Codex reference suppresses only `build-web-apps:frontend-app-builder` with a qualified `[[skills.config]]` name selector. A native `skills/config/write` request for that name can change an installed profile without replacing its TOML. For Claude, `claude plugin disable frontend-design@claude-plugins-official --scope user` is conditional on a verified replacement. Restore an originally enabled plugin with the corresponding enable operation. An absent optional plugin needs no uninstall. Preserve browser, accessibility and engineering skills in multi-capability plugins.
+
+### Configuration history
+
+The frontend configuration uses an integer generation under `visuals.frontend.version`. A verified generation may receive the annotated tag `frontend-skills/v<N>` on the reviewed merge commit. Increase the generation when changing the active set or its pins. Preserve earlier tags. Generation 1 introduces scoped installation, quarantine, offline rollback and browser-based candidate evaluation. The [source review](FRONTEND-SOURCE-REVIEW.md) records candidate-specific evidence. The [task policy](UI-UX-POLICY.md) defines fallback behavior for vacant design roles.
