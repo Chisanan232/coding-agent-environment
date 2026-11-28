@@ -822,6 +822,16 @@ def classify_agent(tin):
 
 
 # --------------------------------------------------------------------------- entry
+JIRA_BASES = ("searchJiraIssuesUsingJql", "getJiraIssue", "createJiraIssue", "editJiraIssue", "addCommentToJiraIssue", "transitionJiraIssue", "getTransitionsForJiraIssue",
+              "getVisibleJiraProjects", "getJiraProjectIssueTypesMetadata", "getJiraIssueTypeMetaWithFields", "createIssueLink", "getIssueLinkTypes", "lookupJiraAccountId",
+              "atlassianUserInfo", "getAccessibleAtlassianResources", "getTeamworkGraphContext", "getTeamworkGraphObject", "addTeamworkGraphContext", "addWorklogToJiraIssue",
+              "getJiraIssueRemoteIssueLinks")  # exactly the Jira tools the owner's settings already allow; nothing new is authorized here
+JIRA_TOOLS = {"mcp__%s__%s" % (srv, b) for srv in ("claude_ai_Atlassian_Rovo", "plugin_atlassian_atlassian") for b in JIRA_BASES}
+INTERNAL_TOOLS = {"ScheduleWakeup", "ReadNotifications", "ToolSearch"}  # resume this session / read its own queue / load tool schemas: no effect outside it
+PEER = re.compile(r"^(uds:/tmp/cc-socks/\d+\.sock|[0-9a-f]{8,40}|[A-Za-z0-9_.-][A-Za-z0-9_. -]{0,63})$")
+SECRET_TEXT = re.compile(r"ghp_[A-Za-z0-9]{20,}|github_pat_|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|xox[abp]-|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{10,}\.")
+
+
 def decide(event):
     tool, tin, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd") or os.getcwd()
     if tool in ("Bash", "Monitor"):
@@ -831,6 +841,28 @@ def decide(event):
         return classify_command(cmd, cwd)
     if tool in ("Agent", "Task"):
         return classify_agent(tin)
+    if tool == "Read":
+        path = tin.get("file_path")
+        if not isinstance(path, str) or not path:
+            return None, "no-path"
+        try:
+            secret_hit(tilde(path), cwd)
+        except SecretRead:
+            return "ask", "credential-path"
+        except Reject:
+            return False, "unjudgeable-path"
+        return True, "native-read"
+    if tool in INTERNAL_TOOLS:
+        return True, "internal-" + tool
+    if tool == "SendMessage":
+        to, text = str(tin.get("to", "")), json.dumps(tin)
+        if SECRET_TEXT.search(text):
+            return "ask", "credential-in-message"
+        if PEER.match(to):
+            return True, "internal-message"
+        return False, "message-target-not-internal"
+    if tool in JIRA_TOOLS:
+        return (True, "authorized-jira") if not SECRET_TEXT.search(json.dumps(tin)) else ("ask", "credential-in-jira-write")
     return None, "tool-not-covered"
 
 

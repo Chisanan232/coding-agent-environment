@@ -132,6 +132,28 @@ class Agent(unittest.TestCase):
         self.assertFalse(decide("Agent", subagent_type="haiku-worker", prompt="READ-ONLY"))
 
 
+class OtherTools(unittest.TestCase):
+    def test_native_read(self):
+        self.assertTrue(decide("Read", file_path=str(ROOT / "README.md")))
+        self.assertEqual(decide("Read", file_path=os.path.expanduser("~/.ssh/id_rsa")), "ask")
+        self.assertEqual(decide("Read", file_path=os.path.expanduser("~/.claude/settings.json")), "ask")
+        self.assertEqual(decide("Read", file_path="/x/app/.env"), "ask")
+        self.assertTrue(decide("Read", file_path="/x/app/.env.example"))
+
+    def test_internal_and_jira(self):
+        for tool in ("ScheduleWakeup", "ReadNotifications", "ToolSearch"):
+            self.assertTrue(decide(tool, prompt="x", delaySeconds=60))
+        self.assertTrue(decide("SendMessage", to="uds:/tmp/cc-socks/70026.sock", message="status"))
+        self.assertTrue(decide("SendMessage", to="ab688205e1e64e3b", message="status"))
+        self.assertFalse(decide("SendMessage", to="bridge:session_01X", message="x"))
+        self.assertEqual(decide("SendMessage", to="peer", message="token ghp_" + "a" * 30), "ask")
+        self.assertTrue(decide("mcp__claude_ai_Atlassian_Rovo__transitionJiraIssue", issueIdOrKey="X-1"))
+        self.assertTrue(decide("mcp__plugin_atlassian_atlassian__addCommentToJiraIssue", body="done"))
+        self.assertIsNone(decide("mcp__claude_ai_Atlassian_Rovo__someNewTool"))
+        self.assertIsNone(decide("mcp__neon__delete_project"))
+        self.assertEqual(decide("mcp__claude_ai_Atlassian_Rovo__addCommentToJiraIssue", body="key AKIA" + "A" * 16), "ask")
+
+
 class Output(unittest.TestCase):
     def run_hook(self, event):
         with tempfile.TemporaryDirectory() as t:
@@ -167,10 +189,10 @@ class Installer(unittest.TestCase):
             self.assertEqual(inst.main(["apply", *base, "--unmerged-ok", "--expect-hook-sha", hs, "--expect-live-sha", ls]), 0)
             new = json.loads(live.read_text())
             self.assertEqual(new["permissions"], {"allow": ["A"], "ask": ["B"]})  # no permission rule touched
-            self.assertEqual([g["matcher"] for g in new["hooks"]["PreToolUse"]], ["Bash", "Bash|Monitor", "Agent"])
+            self.assertEqual([g["matcher"] for g in new["hooks"]["PreToolUse"]], ["Bash", "Bash|Monitor", "Agent", inst.MATCHERS[2]])
             self.assertEqual(inst.main(["verify", *base]), 0)
             self.assertEqual(inst.main(["apply", *base, "--unmerged-ok", "--expect-hook-sha", hs, "--expect-live-sha", ls]), 0)  # idempotent
-            self.assertEqual(len(json.loads(live.read_text())["hooks"]["PreToolUse"]), 3)
+            self.assertEqual(len(json.loads(live.read_text())["hooks"]["PreToolUse"]), 4)
             self.assertEqual(inst.main(["rollback", *base]), 0)
             self.assertEqual(json.loads(live.read_text()), json.loads(before))
             self.assertFalse(dest.exists())

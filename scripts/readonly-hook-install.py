@@ -5,9 +5,9 @@ Owner-run, like candidate-rollout.py: `Edit(~/.claude/settings.json)` and `Edit(
 does not run `apply`. Modes (nothing is written except by `apply` and `rollback`):
   candidate write a matrix settings file (live permissions + rtk hook + this hook) for permission-host-matrix.py --candidate
   plan      print the hashes and the exact groups that would be added
-  apply     back up the settings, install the hook file, add TWO PreToolUse groups (matcher `Bash|Monitor` and matcher `Agent`)
-  verify    check the live install: both groups present exactly once, hook file hash
-  rollback  remove exactly the two groups and restore or remove the hook file (later unrelated settings edits are kept)
+  apply     back up the settings, install the hook file, add THREE PreToolUse groups (`Bash|Monitor`, `Agent`, and the internal/read/Jira tools)
+  verify    check the live install: all three groups present exactly once, hook file hash
+  rollback  remove exactly the three groups and restore or remove the hook file (later unrelated settings edits are kept)
 
 The change is pinned by --expect-live-sha (the settings you reviewed) and --expect-hook-sha (the hook file you reviewed), and the hook
 file must be merged to origin/main (--unmerged-ok is for rehearsals on a copy). Nothing else changes: no permission rule is added,
@@ -35,7 +35,7 @@ HOOK_SRC = ROOT / ".claude/hooks" / HOOK_NAME
 HOOK_DEST = HOME / ".claude/hooks" / HOOK_NAME
 LIVE = HOME / ".claude/settings.json"
 BACKUPS = HOME / ".claude/backups"
-MATCHERS = ("Bash|Monitor", "Agent")  # Bash alone is not enough: a Bash-matched hook's allow has no effect on Monitor (documented, 2.1.314+)
+MATCHERS = ("Bash|Monitor", "Agent", "Read|ScheduleWakeup|ReadNotifications|ToolSearch|SendMessage|mcp__claude_ai_Atlassian_Rovo__.*|mcp__plugin_atlassian_atlassian__.*")  # Bash alone is not enough: a Bash-matched hook's allow has no effect on Monitor (documented, 2.1.314+)
 TIMEOUT = 5
 
 
@@ -112,7 +112,7 @@ def candidate(args):
     rtk = [g for g in (live.get("hooks") or {}).get("PreToolUse", []) if any(str(h.get("command", "")).startswith("rtk hook") for h in g.get("hooks", []))]
     cfg["hooks"] = {"PreToolUse": rtk + groups_for("python3 %s" % args.hook_src)}
     Path(args.out).write_text(json.dumps(cfg, indent=2))
-    print("wrote %s (rtk groups: %d, hook groups: 2)" % (args.out, len(rtk)))
+    print("wrote %s (rtk groups: %d, hook groups: 3)" % (args.out, len(rtk)))
     return 0
 
 
@@ -132,7 +132,7 @@ def apply(args):
     hook_sha, live_sha = hr.sha_bytes(hook_bytes), hr.sha_bytes(raw_bytes)
     dest_sha = rollout.sha(dest) if dest.exists() else None
     if st == "installed" and dest_sha == hook_sha:
-        print("already installed: both groups present once and hook file identical; nothing changed")
+        print("already installed: all groups present once and hook file identical; nothing changed")
         return 0
     if not args.unmerged_ok:
         why = rollout.baseline_not_merged(src)
@@ -190,7 +190,7 @@ def verify(args):
         problems.append("hook file missing")
     elif rollout.sha(dest) != hr.sha_bytes(Path(args.hook_src).read_bytes()):
         problems.append("hook file differs from %s" % args.hook_src)
-    print("VERIFIED readonly-hook installed (2 groups, hook hash matches)" if not problems else "PROBLEMS: " + "; ".join(problems))
+    print("VERIFIED readonly-hook installed (3 groups, hook hash matches)" if not problems else "PROBLEMS: " + "; ".join(problems))
     return 1 if problems else 0
 
 
@@ -209,7 +209,7 @@ def rollback(args):
         return 2
     if state(live, command) == "installed":
         hr.replace_if_unchanged(live_p, hr.serialise(without_groups(live, command), raw).encode(), raw_bytes)
-        print("removed the two hook groups; every other setting kept as it is now")
+        print("removed the three hook groups; every other setting kept as it is now")
     if receipt.get("hook_backup"):
         hr.install_bytes(dest, Path(receipt["hook_backup"]).read_bytes(), 0o755)
     elif receipt.get("hook_created") and dest.exists() and rollout.sha(dest) == receipt["hook_sha"]:
