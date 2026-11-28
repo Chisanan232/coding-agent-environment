@@ -32,7 +32,9 @@ LOG = os.environ.get("ROUTINE_READONLY_HOOK_LOG") or os.path.join(HOME, ".cache/
 
 # --------------------------------------------------------------------------- secret paths
 _SECRET_RE = re.compile("|".join([
-    r"(^|/)[^/]*\.env(rc)?$", r"(^|/)\.(vault-token|boto|s3cfg|oci|gradle|m2|zsh_sessions|bash_sessions|aws-vault|cargo/credentials(\.toml)?)(/|$)", r"(^|/)(gradle\.properties|settings\.xml|\.cargo/credentials)$", r"(^|/)\.env\.(?!(example|sample|template|dist|defaults?)$)[^/]+$",
+    r"(^|/)[^/]*\.env(rc)?$", r"(^|/)\.(vault-token|boto|s3cfg|oci|gradle|m2|zsh_sessions|bash_sessions|aws-vault|cargo/credentials(\.toml)?)(/|$)",
+    r"(^|/)\.(codex|gemini|wrangler|stripe|vercel|composer|ngrok2?|bundle|huggingface|databrickscfg|snowsql|pnpmrc|mysql_history|rediscli_history|sqlite_history|irb_history|viminfo)(/|$)",
+    r"(^|/)\.cache/(gh|gcloud)(/|$)", r"(^|/)(gradle\.properties|settings\.xml|\.cargo/credentials)$", r"(^|/)\.env\.(?!(example|sample|template|dist|defaults?)$)[^/]+$",
     r"(^|/)\.(ssh|aws|gnupg|kube|azure|docker|terraform\.d|op)(/|$)", r"(^|/)\.config(/|$)", r"(^|/)\.local/share/(keyrings|gh)(/|$)",
     r"(^|/)\.(netrc|npmrc|yarnrc|pypirc|pgpass|git-credentials|terraformrc|my\.cnf|gitconfig|envrc)$",
     r"(^|/)\.git/(config|credentials)$", r"(^|/)\.claude/settings\.local\.json$",
@@ -80,7 +82,8 @@ def _secret_hit(word, cwd):
     for c in cands:
         if _SECRET_RE.search(c):
             return True
-        if any(c == r or c.startswith(r + "/") for r in _HOME_CLAUDE):
+        cl = c.lower()  # APFS is case-insensitive by default
+        if any(cl == r.lower() or cl.startswith(r.lower() + "/") or (r.endswith(".json") and cl.startswith(r.lower())) for r in _HOME_CLAUDE):
             return True
     return False
 
@@ -103,6 +106,8 @@ ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
 
 
 def secret_hit(word, cwd):
+    if "**" in word:
+        raise Reject("globstar")
     if _secret_hit(word, cwd):
         raise SecretRead(word[:40])
     return False
@@ -389,28 +394,40 @@ def ok_grep(args):
 
 
 def ok_rtk_grep(args, cwd):
-    """`rtk grep` searches recursively (hidden files skipped): flags are an allowlist and a search root must be inside a development tree."""
-    valued = ("-e", "-m", "-A", "-B", "-C", "-g", "-t", "-l", "--max-len", "--max", "--glob", "--file-type", "-T")
-    if not flags_ok(args, short="ivnclwxqsHhoFEIa0123456789", long_exact=("--context-only", "--ultra-compact", "--ignore-case", "--invert-match", "--count",
-                    "--files-with-matches", "--word-regexp", "--fixed-strings", "--line-buffered", "--no-messages", "--only-matching"),
-                    long_prefix=("--color=", "--regexp=", "--max-count=", "--max-len=", "--max=", "--glob=", "--file-type="), valued=valued):
+    """`rtk grep` searches recursively (hidden files skipped). Allowlisted flags, no `--` and no -g/--glob (rg takes `--pre`, `--hidden` and globs that
+    re-include hidden files), and a root inside the working tree under ~/Bryant-Developments that holds no credential-named file."""
+    valued = ("-e", "-m", "-A", "-B", "-C", "-t", "--max-len", "--max", "--file-type", "-l", "-T")
+    if "--" in args or not flags_ok(args, short="ivnclwxqsHhoFEIa0123456789", long_exact=("--context-only", "--ultra-compact", "--ignore-case", "--invert-match",
+                    "--count", "--files-with-matches", "--word-regexp", "--fixed-strings", "--line-buffered", "--no-messages", "--only-matching"),
+                    long_prefix=("--color=", "--regexp=", "--max-count=", "--max-len=", "--max=", "--file-type="), valued=valued):
         return False
     ops = operands(args, valued)
     roots = ops[1:] or ["."]  # first operand is the pattern
-    return all(root_ok(r, cwd) for r in roots)
+    base = os.path.realpath(cwd)
+    dev = os.path.realpath(os.path.join(HOME, "Bryant-Developments"))
+    for r in roots:
+        p = os.path.realpath(os.path.join(cwd, tilde(r)))
+        if not (p == base or p.startswith(base + "/")) or not (p == dev or p.startswith(dev + "/")):
+            return False
+        tree_secret_scan(p)
+    return True
 
 
-DEV_ROOTS = (os.path.join(HOME, "Bryant-Developments"), "/tmp", "/private/tmp", "/private/var/folders", os.path.join(HOME, ".cache/coding-agent-environment"),
-             os.path.join(HOME, ".cargo/shared-target"))
-
-
-def root_ok(path, cwd):
-    p = os.path.realpath(os.path.join(cwd, tilde(path)))
-    return any(p == r or p.startswith(r + "/") for r in DEV_ROOTS) or any(p == os.path.realpath(r) or p.startswith(os.path.realpath(r) + "/") for r in DEV_ROOTS)
+def tree_secret_scan(root, cap=4000):
+    """Ask when a non-hidden credential-named file sits under `root` (rg would print it); fall through when the tree is too big to judge."""
+    seen = 0
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if not x.startswith(".") and x not in ("node_modules", "target", "__pycache__")]
+        for f in files:
+            seen += 1
+            if seen > cap:
+                raise Reject("tree too large to judge")
+            if not f.startswith(".") and _SECRET_RE.search(os.path.join(d, f)):
+                raise SecretRead(f)
 
 
 GIT_DANGEROUS = ("output", "ext-diff", "textconv", "no-index", "open-files-in-pager", "exec", "exec-path", "upload-pack", "receive-pack", "git-dir", "work-tree",
-                 "namespace", "config-env", "paginate", "pager", "super-prefix", "attr-source")
+                 "namespace", "config-env", "paginate", "pager", "super-prefix", "attr-source", "help")
 GIT_READ = {"status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "merge-base", "describe", "shortlog", "name-rev", "for-each-ref",
             "show-ref", "branch", "tag", "stash", "worktree"}
 
@@ -419,7 +436,7 @@ def git_option_dangerous(a):
     if a.startswith("--"):
         name = a[2:].split("=", 1)[0]
         return bool(name) and any(d.startswith(name) for d in GIT_DANGEROUS)
-    return a.startswith("-O")
+    return a.startswith("-O") or a == "-h"
 
 
 def ok_git(args, cwd):
@@ -466,10 +483,31 @@ def ok_gh(args):
     if len(pos) < 2 or tuple(pos) not in GH_READ:
         return False
     # --jq/--template evaluate an expression that can read the environment; --web opens a browser; nothing else is needed for a read
-    return flags_ok(args[2:], short="LsSRlcq0123456789", long_exact=("--comments", "--name-only", "--patch", "--stat", "--watch", "--failed", "--log-failed",
+    return flags_ok(args[2:], short="LsSRlc0123456789", long_exact=("--comments", "--name-only", "--patch", "--stat", "--watch", "--failed", "--log-failed",
                     "--verbose", "--exit-status"), long_prefix=("--json=", "--repo=", "--limit=", "--state=", "--search=", "--author=", "--label=", "--base=", "--head=",
                     "--branch=", "--workflow=", "--status="), valued=("--json", "--repo", "-R", "--limit", "-L", "--state", "-s", "--search", "-S", "--author",
                     "--label", "--base", "--head", "--branch", "--workflow", "--status")) and "-q" not in args and "--jq" not in args
+
+
+def no_cargo_wrapper():
+    """cargo runs `rustc -vV` through build.rustc-wrapper from any .cargo/config* above the cwd: refuse when one is configured (cwd comes from the event)."""
+    d = os.path.realpath(os.getcwd())
+    dirs = []
+    while True:
+        dirs.append(d)
+        if d in ("/", HOME):
+            break
+        d = os.path.dirname(d)
+    dirs.append(HOME)
+    for d in dirs:
+        for name in ("config.toml", "config"):
+            f = os.path.join(d, ".cargo", name)
+            try:
+                if os.path.isfile(f) and re.search(r"wrapper|runner", open(f).read()):
+                    return False
+            except OSError:
+                return False
+    return True
 
 
 def ok_cargo(args):
@@ -479,10 +517,10 @@ def ok_cargo(args):
         return False
     v, rest = args[0], args[1:]
     if v == "metadata":
-        return "--offline" in rest and flags_ok(rest, long_exact=("--offline", "--no-deps", "--frozen", "--locked"), long_prefix=("--format-version=",),
+        return "--offline" in rest and no_cargo_wrapper() and flags_ok(rest, long_exact=("--offline", "--no-deps", "--frozen", "--locked"), long_prefix=("--format-version=",),
                                                  valued=("--format-version",))
     if v == "tree":
-        return "--offline" in rest and flags_ok(rest, short="eid", long_exact=("--offline", "--frozen", "--locked", "--workspace"), long_prefix=("--depth=",),
+        return "--offline" in rest and no_cargo_wrapper() and flags_ok(rest, short="eid", long_exact=("--offline", "--frozen", "--locked", "--workspace"), long_prefix=("--depth=",),
                                                  valued=("--depth", "-p", "--package"))
     return False
 
@@ -600,10 +638,12 @@ def judge(argv, cwd, state):
         return ok_diff(args)
     if prog == "tree":
         return ok_tree(args)
-    if prog in ("test", "["):
+    if prog in ("test", "["):  # file and string tests only: `-v NAME` evaluates an array subscript
+        return all(a in ("-f", "-d", "-e", "-s", "-r", "-w", "-x", "-z", "-n", "-L", "!", "=", "==", "!=", "]") or not (a.startswith("-") or "[" in a or "$" in a) for a in args)
+    if prog == "echo":  # prints its operands; `echo ---` is text, not an option
         return True
-    if prog in ("echo", "printf"):  # prints its operands; `echo ---` is text, not an option
-        return True
+    if prog == "printf":
+        return "-v" not in args  # printf -v 'a[$(cmd)]' evaluates the subscript
     if prog in SIMPLE_FLAGS:
         short, valued = SIMPLE_FLAGS[prog]
         return flags_ok(args, short=short, valued=valued)
@@ -613,51 +653,78 @@ def judge(argv, cwd, state):
 PROTECTED_VAR = re.compile(r"^(HOME|PATH|IFS|SHELL|ENV|BASH_ENV|PS[0-9]|PROMPT_COMMAND|CDPATH|GLOBIGNORE|GIT_|LD_|DYLD_|PYTHON|PYTEST_|CARGO_|RUST|RTK_|NODE_|NPM_|PAGER|EDITOR|VISUAL|LESS|TMPDIR|XDG_|LC_|LANG|OLDPWD|PWD)")
 KILLERS = {"pkill", "killall", "kill"}
 WORKTREE_MUTATING = {"add", "remove", "prune", "move", "lock", "unlock", "repair"}
+COARSE_DANGER = re.compile(
+    r"\b(pkill|killall|kill)\b|\brm\s+(-\S*[rRf]\S*|--rec\S*|--force)|worktree\s+(add|remove|prune|move)|\bgit\b.*\bpush\b.*(--force|--delete|--mirror|\s-f\b|\s\+\S)"
+    r"|reset\s+--hard|\bgit\s+clean\b|gh\s+pr\s+merge|\bfind\b.*-delete|xargs\s+(\S+\s+)*rm\b")
 
 
 def danger(words):
     """Operations the owner can authorize but must be asked about, found in any stage whatever the other stages are."""
     prog, args = words[0], words[1:]
-    while prog in ("rtk", "proxy", "command", "nohup", "time", "sudo", "env") and args:
+    while prog in ("rtk", "proxy", "command", "nohup", "time", "sudo", "env", "xargs") and args:
         prog, args = args[0], args[1:]
+    prog = os.path.basename(prog)
     if prog in KILLERS:
         raise AskNeeded("process-kill")
-    if prog == "rm" and any(a in ("-r", "-R", "--recursive", "-f", "--force") or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("rRf")) for a in args):
+    if prog == "rm" and any(a in ("-r", "-R", "-f") or a.startswith("--rec") or a.startswith("--for") or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("rRf")) for a in args):
         raise AskNeeded("recursive-or-forced-delete")
+    if prog == "find" and "-delete" in args:
+        raise AskNeeded("find-delete")
+    if prog == "gh" and args[:2] in (["pr", "merge"], ["repo", "delete"], ["release", "delete"]):
+        raise AskNeeded("gh-destructive")
     if prog == "git":
         i = 0
         while i < len(args) and args[i].startswith("-"):
             i += 2 if args[i] in ("-C", "-c") else 1
-        if i + 1 < len(args) and args[i] == "worktree" and args[i + 1] in WORKTREE_MUTATING:
+        verb, rest = (args[i], args[i + 1:]) if i < len(args) else ("", [])
+        if verb == "worktree" and rest[:1] and rest[0] in WORKTREE_MUTATING:
             raise AskNeeded("worktree-change")
+        if verb == "push" and any(a in ("-f", "-d") or a.startswith(("--force", "--delete", "--mirror", "+")) or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("fd")) for a in rest):
+            raise AskNeeded("force-or-delete-push")
+        if verb == "reset" and "--hard" in rest or verb == "clean":
+            raise AskNeeded("discard-work")
+        if verb == "branch" and any(a in ("-D", "-d", "--delete") for a in rest) or verb == "tag" and any(a in ("-d", "--delete") for a in rest):
+            raise AskNeeded("ref-delete")
+        if verb == "stash" and rest[:1] and rest[0] in ("drop", "clear"):
+            raise AskNeeded("stash-delete")
 
 
 STRUCT_PREFIX = {"until", "while", "if", "elif", "then", "else", "do", "!"}
+SAFE_LOOP_CMD = ("read",)
 
 
 def classify_command(src, cwd):
-    """-> (True, reason) when every stage of `src` is read-only, else (False, why)."""
+    """-> (True, reason) when every stage of `src` is read-only, (False, why) when it is not provable, ("ask", why) for an operation the owner must authorize."""
+    res = _classify(src, cwd)
+    if res[0] is not True and res[0] != "ask" and COARSE_DANGER.search(src):  # a reject before a dangerous stage must not hide it
+        return "ask", "dangerous-keyword"
+    return res
+
+
+def _classify(src, cwd):
     try:
         toks = tokenize(src)
-        vars_, loopvars, cur, failed = {}, set(), cwd, None
-        seg, segs = [], []
+        vars_, loopvars, failed = {}, set(), None
+        cwds, pending = [cwd], None
+        seg, segs, op = [], [], ";"
         for t in toks + [("op", ";")]:
             if t[0] == "op":
-                segs.append(seg); seg = []
+                segs.append((op, seg)); seg, op = [], t[1]
             else:
                 seg.append(t)
-        opened = closed = ifs = fis = 0
-        stages = 0
-        for seg in segs:
+        closed = ifs = fis = stages = 0
+        for op_before, seg in segs:
             if not seg:
                 continue
-            if any(t[0] == "redir" for t in seg) and not all(redir_ok(t[1], t[2], t[3], cwd) for t in seg if t[0] == "redir"):
-                return False, "redirect"
+            if pending is not None:  # the cd before this stage may have failed: keep both directories unless `&&` guarantees it succeeded
+                old, new = pending
+                cwds = [new] if op_before == "&&" else old + [new]
+                pending = None
+            if any(t[0] == "redir" for t in seg) and not all(redir_ok(t[1], t[2], t[3], cwds[-1]) for t in seg if t[0] == "redir"):
+                failed = failed or (False, "redirect")
             words = [t for t in seg if t[0] == "word"]
             seg_words = [expand_word(w, vars_) for w in words]
             while seg_words and seg_words[0] in STRUCT_PREFIX:
-                if seg_words[0] in ("until", "while"):
-                    opened += 0
                 if seg_words[0] == "if":
                     ifs += 1
                 seg_words.pop(0)
@@ -667,55 +734,53 @@ def classify_command(src, cwd):
             if first == "done":
                 closed += 1
                 if len(seg_words) > 1:
-                    return False, "done args"
+                    failed = failed or (False, "done args")
                 continue
             if first == "fi":
                 fis += 1
                 if len(seg_words) > 1:
-                    return False, "fi args"
+                    failed = failed or (False, "fi args")
                 continue
             if first == "for":
-                if len(seg_words) < 3 or seg_words[2] != "in" or not NAME.fullmatch(seg_words[1]):
-                    return False, "for"
+                if len(seg_words) < 3 or seg_words[2] != "in" or not NAME.fullmatch(seg_words[1]) or seg_words[1] in os.environ or PROTECTED_VAR.match(seg_words[1]):
+                    failed = failed or (False, "for")
+                    continue
                 loopvars.add(seg_words[1])
                 for w in seg_words[3:]:
-                    if secret_hit(tilde(w), cwd):
-                        return False, "secret"
-                opened += 1
+                    for c in cwds:
+                        secret_hit(tilde(w), c)
                 continue
             if all(ASSIGN.match(w) for w in seg_words):
                 for w in seg_words:
                     m = ASSIGN.match(w)
                     if m.group(1) in loopvars or m.group(1) in os.environ or PROTECTED_VAR.match(m.group(1)):
-                        return False, "assign to an existing or protected variable"
-                    vars_[m.group(1)] = tilde(m.group(2))
+                        failed = failed or (False, "assign to an existing or protected variable")
+                    else:
+                        vars_[m.group(1)] = tilde(m.group(2))
                 continue
             if ASSIGN.match(first):
-                return False, "env prefix"
+                failed = failed or (False, "env prefix")
+                continue
             if first == "cd":
-                if len(seg_words) > 2 or (len(seg_words) == 2 and seg_words[1].startswith("-")):
+                if len(seg_words) > 2 or (len(seg_words) == 2 and (seg_words[1].startswith("-") or (seg_words[1].startswith("~") and tilde(seg_words[1]) == seg_words[1]))):
                     failed = failed or (False, "cd form")
                     continue
                 raw = tilde(seg_words[1]) if len(seg_words) == 2 else HOME
-                nxt = os.path.normpath(os.path.join(cur, raw))
+                nxt = os.path.normpath(os.path.join(cwds[-1], raw))
                 real = os.path.realpath(nxt)
                 if ".." in raw.split("/") and real != nxt:  # logical and physical `..` disagree through a symlink: do not guess
                     failed = failed or (False, "cd dotdot through symlink")
                     continue
-                secret_hit(real, cur)
-                nxt = real
-                cur = nxt
+                secret_hit(real, cwds[-1])
+                pending = (list(cwds), real)
                 stages += 1
                 continue
             danger(seg_words)
-            if failed is None and not judge(seg_words, cur, vars_):
+            if failed is None and not all(judge(seg_words, c, vars_) for c in cwds):
                 failed = (False, "stage: " + first)
                 continue
             stages += 1
-            if "do" in [expand_word(w, vars_) for w in words[:1]]:
-                pass
-        # an until/while body is introduced by `do` and closed by `done`; count `do` words conservatively
-        do_count = sum(1 for seg in segs if seg and seg[0][0] == "word" and seg[0][1] == [("lit", "do")])
+        do_count = sum(1 for _, sg in segs if sg and sg[0][0] == "word" and sg[0][1] == [("lit", "do")])
         if failed:
             return failed
         if closed != do_count or fis != ifs:

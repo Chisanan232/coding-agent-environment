@@ -34,10 +34,13 @@ ALLOW = [
     "rtk read README.md --tail-lines 2 | cut -c1-160", "rtk read README.md --max-lines 20", "rtk grep -v x README.md | tail -40", "rtk git status", "rtk wc -l README.md",
     "rtk grep marker src", "wc -l README.md | head", "git ls-files | wc -l", "stat README.md", "head -c 100 README.md", "cat README.md 2>/dev/null | head -3",
     "sed -n '1,5p' README.md", "sed -n -e 1p README.md", "sort README.md | uniq -c | head", "sort -k2,2 -n README.md | head", "sort -u README.md",
-    "cargo metadata --offline --format-version 1 | head -c 200", "git diff --stat | tail -3", "git log --oneline -5 --format=%H", "gh pr view 5 --repo o/r --json state",
+    "cargo metadata --offline --format-version 1 | head -c 200", "printf '%s\n' a", "[ -f README.md ] && echo yes", "git diff --stat | tail -3", "git log --oneline -5 --format=%H", "gh pr view 5 --repo o/r --json state",
     "find . -name '*.py' -type f | wc -l", "jq .a /tmp/x.json", "diff -u README.md /tmp/x", "python3 %s/scripts/memory-admission.py check --weight heavy" % MV,
 ]
 FALLTHROUGH = [
+    "printf -v 'a[$(echo X)]' x", "[ -v 'a[$(echo X)]' ]", "test -v x", "for PATH in /tmp; do cat x; done", "for HOME in /tmp; do ls; done", "rtk grep x . -- --pre ./a.sh",
+    "rtk grep x . -- --hidden", "rtk grep . . -g '.[e]nv'", "rtk grep . ~/Bryant-Developments", "gh pr view 1 --json body -cq env", "git diff --help", "git log -h",
+    "cd ~bryant; cat .claude.json", "cargo metadata --offline --locked ; frobnicate", "env X=1 ls", "FOO=1 ls; echo hi",
     "sed -n 1p README.md > /tmp/o", "sed -i s/a/b/ README.md", "sed -n 'w /tmp/x' README.md", "sed -n '1e rm -rf /tmp/x' README.md", "sed -ni 1p README.md",
     "sed --in-pl s/a/b/ README.md", "rm sed-notes.txt", "./sed-notes.txt", "python3 sed-notes.py", "git push --force origin main", "gh pr merge 5 --repo a/b",
  "echo $(whoami)", "cat `ls`", "FOO=1 cat README.md", "find . -name x -delete", "awk 'BEGIN{system(\"rm x\")}'",
@@ -53,6 +56,10 @@ FALLTHROUGH = [
     "tree --output=/tmp/x", "file -C -m /tmp/x", "cd -", "cd -P x", "git branch newname", "git branch -f x", "awk 'BEGIN{ARGV[1]=\".env\"}1' README.md", "tree -I -o x", "echo a;; echo b",
 ]
 ASK = [
+    "cat ~/.CLAUDE.json", "cat ~/.Claude/.credentials.json", "cat ~/.claude.json.backup", "cat ~/**/.claude.json", "cat ~/.codex/auth.json", "cat ~/.wrangler/config/default.toml",
+    "cat ~/.cache/gh/x", "FOO=1 ls; pkill x", "ls > o; pkill x", "ls $(x); rm -rf /", "env X=1 rm -rf x", "sudo -n rm -rf x", "/bin/rm -rf x",
+    "xargs rm -rf", "rm --rec x", "find . -delete", "git push --force-with-lease", "git push origin +main", "git push -f", "git reset --hard HEAD~1", "git clean -fd",
+    "git branch -D x", "git tag -d v1", "gh pr merge 5", "git stash drop",
     "git worktree add ../x", "rtk git worktree add ../x", "git -C /tmp/r worktree remove x", "pkill -TERM -f foo", "kill 99999", "rm -rf build", "rm -f x", "rtk proxy pkill x",
     "cat README.md; git worktree add ../x", "frobnicate; pkill x",  # credential stores: never silent, never a hook allow; the owner can authorize a disclosure
     "cat ~/.ssh/id_rsa", "cat .env", "cat config/production.env", "cat app.env", "cat ~/.claude/settings.json", "rtk read ~/.claude.json", "cat *.pem", "cat ~/.ss?/id_rsa",
@@ -73,14 +80,16 @@ class Bash(unittest.TestCase):
 
     def test_fall_through(self):
         for c in FALLTHROUGH:
-            self.assertFalse(decide("Bash", command=c), c)
+            self.assertIn(decide("Bash", command=c), (False, "ask"), c)  # never allow; a dangerous keyword may turn the fall-through into an ask
 
     def test_credential_reads_ask(self):
         for c in ASK:
             ok = decide("Bash", command=c)
             self.assertIn(ok, ("ask", False), c)  # an unknown-variable or syntax reject may fall through instead; it must never allow
             self.assertNotEqual(ok, True, c)
-        for c in ASK[:10] + ASK[14:26]:
+        for c in ASK[:60]:
+            if c.startswith(('cat ~/**', 'S=')):
+                continue
             self.assertEqual(decide("Bash", command=c), "ask", c)
 
     def test_filename_containing_sed_grants_nothing(self):
@@ -101,6 +110,11 @@ class Bash(unittest.TestCase):
             os.symlink(os.path.expanduser("~/.ssh"), os.path.join(t, "link"))
             for cmd in ("cd link && ls", "cd link/.. && cat .ssh/config", "cd real/sub/../../link; cat config"):
                 self.assertNotEqual(hook.decide({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": t})[0], True, cmd)
+
+    def test_failed_cd_keeps_the_original_directory(self):
+        home = os.path.expanduser("~")
+        for cmd in ("cd /nonexistent/x || cat .claude.json", "cd /nonexistent/x; cat .claude.json"):
+            self.assertEqual(hook.decide({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": home})[0], "ask", cmd)
 
     def test_other_tools_untouched(self):
         self.assertIsNone(decide("Edit", file_path="x"))
@@ -129,7 +143,7 @@ class Output(unittest.TestCase):
         r, log = self.run_hook({"tool_name": "Bash", "tool_input": {"command": "cat README.md"}, "cwd": CWD})
         self.assertEqual(json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"], "allow")
         self.assertNotIn("README", log)  # the log keeps a hash, never the command text
-        r, _ = self.run_hook({"tool_name": "Bash", "tool_input": {"command": "git push --force"}, "cwd": CWD})
+        r, _ = self.run_hook({"tool_name": "Bash", "tool_input": {"command": "frobnicate --now"}, "cwd": CWD})
         self.assertEqual((r.returncode, r.stdout), (0, ""))
         r, _ = self.run_hook({"tool_name": "Bash", "tool_input": {"command": "cat ~/.ssh/id_rsa"}, "cwd": CWD})
         self.assertEqual(json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"], "ask")
