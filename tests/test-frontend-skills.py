@@ -35,7 +35,7 @@ class FrontendLifecycle(unittest.TestCase):
         (self.root / 'codex').mkdir(parents=True)
         self.name = 'test-skill'
         self.spec = {'repository': self.url, 'paths': ['test-skill', 'LICENSE'],
-                     'skill_path': self.name, 'state': 'active'}
+                     'skill_path': self.name, 'state': 'active', 'role': 'general'}
         self.export = self.area / 'tree'
         (self.export / self.name).mkdir(parents=True)
         (self.export / 'LICENSE').write_text('Fixture license\n')
@@ -203,6 +203,26 @@ class FrontendLifecycle(unittest.TestCase):
             self.run_mode()
         self.assertEqual(receipt.read_text(), '{"foreign":true}')
         self.assertFalse(any(os.path.lexists(p) for p in self.targets))
+
+    def test_conflicting_primaries_and_duplicate_skill_names_refused(self):
+        path = self.root / 'codex/subtraction-skills.json'
+        manifest = json.loads(path.read_text())
+        packages = manifest['visuals']['frontend']['packages']
+        packages['second'] = dict(self.spec, skill_path='second', paths=['second', 'LICENSE'])
+        path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(visuals.VisualSkillsError, 'Multiple active primary'):
+            self.run_mode('dry-run')
+        self.manifest()
+        (self.root / 'codex/shared-skills.json').write_text(json.dumps({'skills': [self.name]}))
+        with self.assertRaisesRegex(visuals.VisualSkillsError, 'duplicates an authored'):
+            self.run_mode('check')
+        (self.root / 'codex/shared-skills.json').write_text(json.dumps({
+            'skills': ['authored-primary'], 'frontend': {'authored-primary': 'general'}}))
+        with self.assertRaisesRegex(visuals.VisualSkillsError, 'Multiple active primary'):
+            self.run_mode('check')
+        path.write_text('{"visuals":{}, "visuals":{}}')
+        with self.assertRaisesRegex(visuals.VisualSkillsError, 'Duplicate key'):
+            self.run_mode('check')
 
 
 if __name__ == '__main__':

@@ -312,7 +312,10 @@ class SPE83PushAllowRegression(unittest.TestCase):
         self.assertEqual(offenders, [], f"re-introduces SPE-83's bypass: {offenders}")
 
 
-@unittest.skipUnless(shutil.which("rtk"), "rtk not installed — SPE-83 regression is skipped, not passed")
+RTK_BINARY = shutil.which("rtk")
+
+
+@unittest.skipUnless(RTK_BINARY, "rtk not installed — SPE-83 regression is skipped, not passed")
 class RTKHookSelfDecision(unittest.TestCase):
     """Exercises the REAL installed rtk binary's PreToolUse hook against a
     disposable $HOME containing exactly this repo's tracked settings.json —
@@ -335,7 +338,7 @@ class RTKHookSelfDecision(unittest.TestCase):
 
     def _hook(self, command):
         proc = subprocess.run(
-            ["rtk", "hook", "claude"],
+            [RTK_BINARY, "hook", "claude"],
             input=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}),
             capture_output=True, text=True, env={"HOME": str(self.tmp_home), "PATH": "/usr/bin:/bin:/opt/homebrew/bin"},
         )

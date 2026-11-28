@@ -20,7 +20,7 @@ overrides a higher layer. Layers 4 and 5 are advisory until their tools are depl
 1. **Product requirements and real users.** Stated requirements, user research, and the people who will actually use the surface.
 2. **Product-owned Design System, brand, and Design Constitution.** Preserve the existing product language for maintenance. For greenfield work or an explicitly authorized creative reboot, identify the constraints the owner kept and the directions they rejected. Start a new [design brief](templates/DESIGN-BRIEF.md) when the desired visual direction changes.
 3. **Platform conventions.** Web standards and WCAG, Apple Human Interface Guidelines for iOS and macOS, Material for Android.
-4. **Task-specific art direction.** Select a single active primary from the frontend section of the visual manifest. An unfilled role falls back to the approved brief and references.
+4. **Task-specific art direction.** Select one primary using the task table below. External candidates must be active in the frontend manifest. The first-party creative skill is delivered through the shared profile.
 5. **Vercel Web Interface Guidelines review.** A manual review checklist, pinned by commit permalink. Status: skill not deployed (see below).
 6. **Optional references.** Owner-supplied visual references and the vetted material selected for this brief. Check [excluded routes](#excluded-from-design-routing) before selecting an additional source.
 7. **Rendered verification.** A gate, not a rank: layers 1 to 6 set the intent, and this layer checks whether the built UI actually meets it. A rendered failure sends the work back to the layer that was violated; it never changes what that layer requires.
@@ -30,9 +30,9 @@ overrides a higher layer. Layers 4 and 5 are advisory until their tools are depl
 | Role | Tool | Notes |
 |---|---|---|
 | Implementation | Product components, browser and local project tooling | Follow the brief for the task mode below. |
-| Art direction, critique, refinement | Exactly **one** primary skill per task when its role has an approved active package | The manifest owns activation. Read only the selected primary and a recipe required by the interaction. |
+| Art direction, critique, refinement | Exactly **one** primary skill per task when its role has an approved active package | Use the active pinned primary. Open an implementation reference only for a matching interaction. |
 | Guidelines review | [Vercel Web Interface Guidelines at `434b7f9`](https://github.com/vercel-labs/web-interface-guidelines/blob/434b7f91364665f2f733b310ec54809bf8f37937/command.md) | Read as a checklist. Do not fetch the moving `main` copy. |
-| Render verification | Playwright (`playwright@claude-plugins-official`, the preferred route on Claude) | Local screenshots only. `.mcp.json` also configures `npx -y @playwright/mcp@latest`; it is unpinned and non-preferred, so use the plugin. |
+| Render verification | Playwright (`playwright@claude-plugins-official`, the preferred route on Claude) | Inspect the native plugin startup command. When it uses a mutable package, prefer the verified local Playwright installation and browser. The unpinned `@playwright/mcp@latest` route is non-preferred. Keep screenshots local. |
 | Design source | The official **Figma plugin** (`figma@claude-plugins-official` on Claude, `figma@openai-curated` on Codex) | The one preferred Figma route. Framelink (`figma-developer-mcp`) is **non-preferred**: it duplicates the plugin, is launched with an unpinned `npx -y`, and in `.mcp.json` only passes the API key as a command-line argument (`codex/config.toml` passes it through the environment). It remains configured in `.mcp.json` and `codex/config.toml` only because removal is a separate owner-reviewed change; do not use it when the plugin is available. |
 | Native Apple build and Simulator | XcodeBuildMCP (task-specific, not installed) | See [Platform QA: iOS](#ios). |
 
@@ -43,9 +43,9 @@ overrides a higher layer. Layers 4 and 5 are advisory until their tools are depl
 | Existing-product maintenance | Record the applicable tokens, behavior and components. Compare the change with the existing rendered surface. |
 | Greenfield design | Start from the audience, content and a visual thesis. Select concrete references for composition, typography and imagery when fidelity matters. |
 | Full creative reboot | Record explicit authorization, the rejected direction and the constraints that survive. Explore a new composition in the browser. An internal style frame or concept image may clarify the brief. |
-| Brand website | For an immersive brand story use the active creative primary if approved. When that role is vacant, use the owner's references and a browser prototype. |
-| Application UI | Use the active general primary for conventional websites, apps and dashboards. Give the user's next action and information hierarchy priority. |
-| Motion design | Specify the trigger, transition, end state, keyboard behavior and reduced-motion equivalent. Consult one approved recipe only for its matching effect. |
+| Brand website | Use a verified creative primary when one is active. Generation 1 routes this brief to the tested pinned `frontend-design` primary. Start with concrete references and a browser prototype. |
+| Application UI | Use the active general primary for conventional websites, apps and dashboards. Generation 1 selects pinned `frontend-design`. The shared engineering skill supplies an optional product-flow reference. Give the user's next action and information hierarchy priority. |
+| Motion design | Specify the trigger, transition, end state, keyboard behavior and reduced-motion equivalent. Open the shared skill’s motion reference or one evaluated external recipe matching the effect. |
 | Creative development | Choose CSS, Canvas, WebGL or a library for a specific interaction and device budget. Judge composition and usability in the actual render. |
 | Visual verification | Inspect the running prototype at target viewports and capture representative motion frames. Review the result against the brief. |
 
@@ -110,7 +110,7 @@ Support is stated per host. Parity is not claimed beyond what was observed.
 
 | Capability | Claude Code | Codex |
 |---|---|---|
-| Primary design skills | User skill links from the verified frontend snapshot | User skill links from the same snapshot |
+| Primary design skills | Authored skill in Claude user scope, plus active pinned packages through managed links | Authored skill in Codex user scope, plus active pinned packages through the shared agent skill directory |
 | Render verification | `playwright@claude-plugins-official` plugin | `browser@openai-bundled` plugin is configured; Playwright equivalence not verified. |
 | Figma | `figma@claude-plugins-official` | `figma@openai-curated` |
 | Pinned skills via the manifest | Symlinked under `~/.claude/skills` or a native plugin | Copied or symlinked under `~/.agents/skills` |

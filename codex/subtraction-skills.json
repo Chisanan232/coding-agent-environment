@@ -66,6 +66,16 @@
     "frontend": {
       "version": 1,
       "packages": {
+        "frontend-design": {
+          "state": "active",
+          "role": "general",
+          "repository": "https://github.com/anthropics/claude-plugins-official.git",
+          "revision": "a7ba5b93db0c7c8d17f3f1d25853adca79598a1a",
+          "paths": ["plugins/frontend-design/skills/frontend-design"],
+          "skill_path": "plugins/frontend-design/skills/frontend-design",
+          "license": "Apache-2.0",
+          "integrity": "sha256:cc0bb08818374b7bb74964d2a9869cca785da0c66355382390da0c8268001cda"
+        },
         "frontend-skill": {
           "state": "quarantined",
           "role": "general",

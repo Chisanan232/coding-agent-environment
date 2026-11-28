@@ -11,6 +11,8 @@ on:
       - '.claude/skills/**'
       - '.claude/hooks/**'
       - 'codex/**'
+      - 'evals/frontend/**'
+      - 'scripts/shared-skill-transaction.py'
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
       - 'scripts/storage-integration.py'
@@ -118,6 +120,8 @@ jobs:
           python3 tests/test-full-parity-install.py
           python3 tests/test-codex-routing.py
           python3 tests/test-frontend-skills.py
+          node --test evals/frontend/architecture/architecture.test.mjs evals/frontend/motion-metrics.test.mjs
+          node --check evals/frontend/check-fixtures.mjs
           python3 tests/test-visual-skills.py
           python3 tests/test-ui-ux-policy.py
           python3 tests/test-storage-integration.py

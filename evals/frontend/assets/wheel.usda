@@ -1,0 +1,38 @@
+#usda 1.0
+(
+    defaultPrim = "Relay"
+    upAxis = "Y"
+    metersPerUnit = 1
+    startTimeCode = 0
+    endTimeCode = 8
+    timeCodesPerSecond = 8
+)
+def Xform "Relay" {
+    def Material "Ochre" {
+        token outputs:surface.connect = </Relay/Ochre/Surface.outputs:surface>
+        def Shader "Surface" {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor = (0.87, 0.46, 0.13)
+            float inputs:roughness = 0.5
+            token outputs:surface
+        }
+    }
+    def Mesh "Wheel" (prepend apiSchemas = ["MaterialBindingAPI"]) {
+        point3f[] points = [(1.0, 0.0, -0.12), (0.70711, 0.70711, -0.12), (0.0, 1.0, -0.12), (-0.70711, 0.70711, -0.12), (-1.0, 0.0, -0.12), (-0.70711, -0.70711, -0.12), (-0.0, -1.0, -0.12), (0.70711, -0.70711, -0.12), (1.0, 0.0, 0.12), (0.70711, 0.70711, 0.12), (0.0, 1.0, 0.12), (-0.70711, 0.70711, 0.12), (-1.0, 0.0, 0.12), (-0.70711, -0.70711, 0.12), (-0.0, -1.0, 0.12), (0.70711, -0.70711, 0.12)]
+        int[] faceVertexCounts = [8, 8, 4, 4, 4, 4, 4, 4, 4, 4]
+        int[] faceVertexIndices = [7, 6, 5, 4, 3, 2, 1, 0, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 9, 8, 1, 2, 10, 9, 2, 3, 11, 10, 3, 4, 12, 11, 4, 5, 13, 12, 5, 6, 14, 13, 6, 7, 15, 14, 7, 0, 8, 15]
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </Relay/Ochre>
+    }
+    def SphereLight "Key" {
+        float inputs:intensity = 100
+        float inputs:radius = 0.3
+        double3 xformOp:translate = (2, 3, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+    def Camera "Camera" {
+        float focalLength = 36
+        double3 xformOp:translate.timeSamples = { 0: (0, 1, 5), 4: (0.2, 1, 4.5), 8: (0, 1, 5) }
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

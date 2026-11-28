@@ -28,7 +28,7 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 | `docs/ARCHITECTURE.md`, `docs/adr/` | Design goals, layering, and ADRs for durable decisions |
 | `docs/CODEX-ROUTING.md` | Portable Codex named-role routing, ownership, lifecycle and evidence boundaries |
 | `docs/MODEL-ROUTING.md`, `docs/ROUTING-EVAL.md`, `evals/routing/` | Claude Code Sonnet-default routing, opt-in Haiku admission table and the precommitted evaluation harness |
-| `docs/UI-UX-POLICY.md`, `docs/templates/`, `docs/FRONTEND-SOURCE-REVIEW.md`, `evals/frontend/` | Shared UI/UX authority order, tool roles and design/QA templates |
+| `docs/UI-UX-POLICY.md`, `docs/templates/`, `docs/FRONTEND-SOURCE-REVIEW.md`, `docs/FRONTEND-REFERENCES.md`, `docs/FRONTEND-COVERAGE.md`, `evals/frontend/` | Shared UI/UX authority order, tool roles and design/QA templates |
 | `docs/ENGINEERING-CONSTITUTION.md` | Cross-harness index of engineering rules; owners keep the text |
 | `mise.toml`, `Brewfile` | Declarative CLI toolchain (see `docs/TOOLCHAIN.md`) |
 | `bin/coding-agent-profile`, `bin/coding-agent-profile-explain`, `bin/ca-claude`, `bin/ca-codex` | Directory-scoped profile resolver + launchers (see `docs/PROFILES.md`) |

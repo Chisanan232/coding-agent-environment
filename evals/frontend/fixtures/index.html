@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Motion studies</title>
+  <link rel="stylesheet" href="fixture.css">
+</head>
+<body>
+<main>
+  <section id="B05" hidden>
+    <h1>Proof light</h1>
+    <div class="stage">
+      <button aria-pressed="false">Light table <span class="track"><i class="marker"></i></span></button>
+    </div>
+    <output>Off</output>
+  </section>
+  <section id="B06" hidden>
+    <h1>Edition proofs</h1>
+    <div class="stage">
+      <div class="frame">
+        <div class="strip marker">
+          <img src="reference.svg" alt="Coastal print">
+          <div class="proof-detail"><img src="reference.svg" alt="Detail of the coastal print"></div>
+        </div>
+      </div>
+    </div>
+    <button>Change proof</button>
+    <output>Full print</output>
+  </section>
+  <section id="B07" hidden>
+    <h1>From shore to strata</h1>
+    <div class="stage">
+      <div class="scroll" tabindex="0" role="region" aria-label="Scroll through three print studies">
+        <div class="pan">
+          <img class="marker" src="reference.svg" alt="Tide strata">
+          <span class="chapter">Shore</span>
+        </div>
+        <div class="distance"></div>
+      </div>
+    </div>
+    <output>Shore</output>
+  </section>
+  <section id="B08" hidden>
+    <h1>Wind field</h1>
+    <div class="stage">
+      <canvas width="480" height="260" role="img" aria-label="Ink marks bend in the local wind field"></canvas>
+    </div>
+    <button>Shift wind</button>
+    <label><input type="checkbox" checked> Animate wind</label>
+    <output>West</output>
+  </section>
+  <section id="B09" hidden>
+    <h1>Counterweight</h1>
+    <div class="stage"><div class="rail"><div class="weight marker"></div></div></div>
+    <button>Move anchor</button>
+    <output>Near</output>
+  </section>
+  <section id="B10" hidden>
+    <div class="stage panorama">
+      <img class="marker" src="reference.svg" alt="Low sun beyond the coastal ridge">
+      <header><span class="caption">Horizon</span><h1>Low Tide</h1></header>
+    </div>
+    <button>Change viewpoint</button>
+    <output>Horizon</output>
+  </section>
+  <section id="B11" hidden>
+    <h1>Print block</h1>
+    <div class="stage perspective">
+      <div class="block marker" role="img" aria-label="Rotatable three-dimensional print block">
+        <i></i><i></i><i></i><i></i><i></i><i></i>
+      </div>
+    </div>
+    <button>Rotate block</button>
+    <output>Face 1</output>
+  </section>
+  <section id="B12" hidden>
+    <h1>Strata editions</h1>
+    <div class="stage">
+      <canvas width="480" height="260" role="img" aria-label="Seeded contour drawing"></canvas>
+    </div>
+    <button>Next seed</button>
+    <output>Seed 1</output>
+  </section>
+</main>
+<script src="fixture.js"></script>
+</body>
+</html>

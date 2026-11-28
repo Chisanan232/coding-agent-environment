@@ -1,5 +1,7 @@
 # Bounded frontend skill benchmark
 
+The [case matrix](MATRIX.md) maps the five briefs, eight motion fixtures, optional shader probe and architecture review to B01–B14.
+
 The five briefs cover a premium print studio, a dispatch dashboard, a crop viewer, a two-scene transition and a mobile pickup form. Each arm receives identical copy, interaction requirements and an original coastal print. The artwork also supplies a common color reference for the application briefs.
 
 ## Paired generation

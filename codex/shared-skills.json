@@ -7,6 +7,7 @@
     "ci-failure-triage",
     "code-review-prep",
     "codebase-memory",
+    "creative-frontend-engineering",
     "cross-repo-coordinator",
     "decision-delegation",
     "dependency-upgrade-review",
@@ -42,6 +43,7 @@
     "typescript-tsc-debugging",
     "workflow-resume"
   ],
+  "frontend": {"creative-frontend-engineering": "recipe", "acceptance-validation": "verification"},
   "resources": {
     "engineering-runtime": {
       "scripts/ticket-state.py": ".claude/hooks/ticket-state.py",

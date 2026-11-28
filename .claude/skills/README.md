@@ -145,6 +145,7 @@ asking Claude Code to run the named procedure.
 | `code-review-prep` | Auto | Before opening a PR |
 | `ci-failure-triage` | Auto | When CI is red |
 | `acceptance-validation` | Auto | Before declaring implementation complete |
+| `creative-frontend-engineering` | Task-scoped | Brand scenes, product flows, motion, creative engineering and rendered critique |
 | `bot-pr-maintainer` | Auto | When a bot PR is classified as clean or conflicted |
 | `pr-feedback-response` | Auto | When a PR has new review comments or Request Changes |
 | `post-merge-close` | Auto | After a PR is merged — close ticket, delete branch |

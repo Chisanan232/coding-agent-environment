@@ -76,9 +76,18 @@ def reject_symlink_chain(path: Path, boundary: Path) -> None:
             raise VisualSkillsError(f"Refusing symlinked managed path: {current}")
 
 
+def unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise VisualSkillsError(f'Duplicate key in managed JSON: {key}')
+        result[key] = value
+    return result
+
+
 def read_json(path: Path, default: Any) -> Any:
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(), object_pairs_hook=unique_keys)
     except FileNotFoundError:
         return default
     except (OSError, json.JSONDecodeError) as exc:
@@ -310,7 +319,25 @@ def run_claude(args: list[str]) -> None:
 def frontend_catalog(root: Path) -> dict:
     manifest = read_json(root / 'codex/subtraction-skills.json', {})
     catalog = manifest['visuals']['frontend']['packages']
+    shared = read_json(root / 'codex/shared-skills.json', {})
+    shared_names = shared.get('skills', [])
+    if set(catalog).intersection(shared_names):
+        raise VisualSkillsError('An external skill duplicates an authored shared skill.')
+    authored = shared.get('frontend', {})
+    if not set(authored).issubset(shared_names) or any(role not in {'general', 'creative', 'verification', 'recipe'} for role in authored.values()):
+        raise VisualSkillsError('Invalid authored frontend routing declaration.')
+    primary_roles = [role for role in authored.values() if role in {'general', 'creative'}]
+    active_primaries = set(primary_roles)
+    if len(active_primaries) != len(primary_roles):
+        raise VisualSkillsError('Multiple active primary skills in the shared profile.')
     for name, spec in catalog.items():
+        role = spec.get('role')
+        if role not in {'general', 'creative', 'recipe'}:
+            raise VisualSkillsError(f'Unknown frontend role for {name}.')
+        if role != 'recipe' and spec['state'] == 'active':
+            if role in active_primaries:
+                raise VisualSkillsError(f'Multiple active primary skills for {role}.')
+            active_primaries.add(role)
         if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', name):
             raise VisualSkillsError('Invalid frontend skill name.')
         if not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+\.git', spec['repository']):

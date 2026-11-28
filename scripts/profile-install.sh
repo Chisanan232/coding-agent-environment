@@ -55,6 +55,7 @@ CAPABILITIES=0
 REMOVE=0
 SHARED_SELECTION=""
 SHARED_SELECTION_SET=0
+RESTORE_SHARED=""
 POLICY_ONLY=0
 
 for arg in "$@"; do
@@ -66,6 +67,7 @@ for arg in "$@"; do
         --check) CHECK=1 ;;
         --capabilities) CAPABILITIES=1 ;;
         --remove) REMOVE=1 ;;
+        --restore-shared=*) RESTORE_SHARED="${arg#*=}"; [[ "$RESTORE_SHARED" =~ ^[0-9]{8}T[0-9]{12}Z$ ]] || { echo "Invalid backup ID." >&2; exit 2; } ;;
         --shared-skills=*)
             if (( SHARED_SELECTION_SET )); then
                 echo 'Specify --shared-skills exactly once.' >&2; exit 2
@@ -78,6 +80,9 @@ for arg in "$@"; do
     esac
 done
 
+if [[ -n "$RESTORE_SHARED" ]] && { [[ -z "$SHARED_SELECTION" ]] || (( DRY_RUN || CHECK )); }; then
+    echo "Restore requires a shared skill selection and apply mode." >&2; exit 2
+fi
 if [[ -n "$SHARED_SELECTION" ]] && (( ! GLOBAL )); then
     echo "--shared-skills requires --global or --claude-skills." >&2
     exit 2
@@ -180,11 +185,15 @@ PYCAPABILITIES
 fi
 
 if (( GLOBAL )); then
+    if [[ "$HOST_MODE" == claude && -n "${CLAUDE_CONFIG_DIR:-}" && "$CLAUDE_CONFIG_DIR" != "${CODING_AGENT_SYNC_HOME:-$HOME}/.claude" ]]; then
+        echo 'Claude mode requires the selected user Claude home.' >&2
+        exit 2
+    fi
     if [[ "$HOST_MODE" == codex && -n "${CODEX_HOME:-}" && "$CODEX_HOME" != "${CODING_AGENT_SYNC_HOME:-$HOME}/.codex" ]]; then
         echo 'Global mode requires the standard user Codex home; custom CODEX_HOME is not managed.' >&2
         exit 2
     fi
-    python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" "$HOST_MODE" "$SHARED_SELECTION" "$POLICY_ONLY" <<'PYGLOBAL'
+    python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" "$HOST_MODE" "$SHARED_SELECTION" "$POLICY_ONLY" "$RESTORE_SHARED" <<'PYGLOBAL'
 import datetime
 import hashlib
 import json
@@ -223,6 +232,23 @@ def reject_symlinks(path):
             break
         if part.is_symlink():
             raise ValueError(f'Refusing mutation through symlink: {part}')
+        if part.exists() and part.stat().st_uid != os.getuid():
+            raise ValueError(f'Refusing foreign-owned path: {part}')
+
+# Serialize shared-profile mutations across selected and full installs. Closing
+# this process releases the directory lock even if the update is interrupted.
+if not dry and not check:
+    import fcntl
+    host_root = live / host_dir
+    reject_symlinks(host_root)
+    host_root.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(host_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    if os.fstat(lock_fd).st_uid != os.getuid():
+        raise SystemExit('Refusing foreign host root.')
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit('Another shared profile operation holds the lock.')
 
 # Preflight must finish before mutation so a bad skill target cannot leave AGENTS partly applied.
 if host_mode == 'claude':
@@ -233,12 +259,13 @@ if host_mode == 'claude':
 else:
     policy = (root / 'codex/AGENTS.md').read_bytes()
     agents = live / '.codex/AGENTS.md'
-    if (agents.parent / 'AGENTS.override.md').exists():
+    if not selection and (agents.parent / 'AGENTS.override.md').exists():
         raise SystemExit('AGENTS.override.md overrides AGENTS.md; reconcile it explicitly first.')
 lo, hi = managed_span(policy)
 block = policy[lo:hi]
-reject_symlinks(agents)
-prior = agents.read_bytes() if agents.exists() else b''
+if not selection:
+    reject_symlinks(agents)
+prior = agents.read_bytes() if not selection and agents.exists() else b''
 if host_mode == 'codex' and b'<!-- cost-aware-routing:start -->' in prior:
     # One founder-authorized legacy routing policy predates the shared block.
     # Retire only its exact known bytes; unknown instruction policy is a conflict.
@@ -258,7 +285,7 @@ elif prior:
     merged = prior + (b'' if prior.endswith(b'\n') else b'\n') + b'\n' + block + b'\n'
 else:
     merged = policy if host_mode == 'codex' else block + b'\n'
-if host_mode == 'claude':
+if host_mode == 'claude' and not selection:
     # Optional private overlay (live-only clauses). It lives outside the repository, is never
     # printed, and only its own marker span is replaced or appended in the live policy.
     local_dir = Path(os.environ.get('CODING_AGENT_LOCAL_DIR') or live / '.config/coding-agent-environment/local')
@@ -338,6 +365,36 @@ for name in shared_manifest['profiles'] if host_mode == 'codex' and not selectio
     if target.exists() and not target.read_bytes().startswith(b'# coding-agent-environment:managed-'):
         raise SystemExit(f'Refusing unowned native profile: {target}')
     managed.append((target, source.read_bytes(), str(source.relative_to(root))))
+def write_managed(path, data, mode, *, stage=None, publish=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=stage or path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+        os.chmod(name, mode)
+        if publish:
+            publish(name, path)
+        else:
+            os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+import runpy
+transaction = runpy.run_path(str(root / 'scripts/shared-skill-transaction.py'))['selected']
+if selection and (sys.argv[8] or set(selection).intersection(shared_manifest.get('frontend', []))):
+    raise SystemExit(transaction(live, host_mode, selection, managed, sys.argv[8], dry, check,
+                                 reject_symlinks, write_managed))
+
+# The two frontend skills have the same ownership rules during full bootstrap.
+frontend_names = shared_manifest.get('frontend', [])
+frontend_roots = [live / host_dir / 'skills' / name for name in frontend_names]
+frontend = [row for row in managed if any(folder in row[0].parents for folder in frontend_roots)]
+managed = [row for row in managed if row not in frontend]
+def full_frontend(preview, count_only=False):
+    return transaction(live, host_mode, frontend_names, frontend, '', preview, not preview and check,
+                       reject_symlinks, write_managed, count_only=count_only) if frontend else 0
+
 plans = []
 for path, data, label in managed:
     profile = path.name in shared_manifest['profiles']
@@ -369,11 +426,12 @@ for path in stale_host_specific:
     print(f'STALE host-specific file (report only; operator must delete): {path}')
 remaining = len(plans) + len(missing)
 if dry or check:
-    remaining += len(stale_host_specific)
+    remaining += len(stale_host_specific) + full_frontend(bool(dry), count_only=True)
     print(f'{drift_label}: {remaining}')
     raise SystemExit(int(bool(remaining) and check))
 if missing and live.resolve() != Path.home().resolve():
     raise SystemExit('External installation requires the actual home; fixture checks stay offline.')
+full_frontend(True)
 lock = live / '.agents/.skill-lock.json'
 if missing:
     reject_symlinks(lock)
@@ -410,18 +468,10 @@ if missing:
         if not all((folder / name).is_file() and hashlib.sha256((folder / name).read_bytes()).hexdigest() == digest
                    for name, digest in manifest['skills'][skill]['files'].items()):
             raise SystemExit('External installer did not produce the pinned canonical content; restore from backup.')
+full_frontend(False)
 for path, data in plans:
-    path.parent.mkdir(parents=True, exist_ok=True)
     mode = 0o600 if path.name in shared_manifest['profiles'] else (stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644)
-    fd, name = tempfile.mkstemp(dir=path.parent)
-    try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(data)
-        os.chmod(name, mode)
-        os.replace(name, path)
-    finally:
-        if os.path.exists(name):
-            os.unlink(name)
+    write_managed(path, data, mode)
     if path.read_bytes() != data:
         raise SystemExit(f'Validation failed: {path}')
 print(f'{drift_label}: 0')

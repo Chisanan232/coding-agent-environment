@@ -19,7 +19,9 @@ const modulePath = process.env.FRONTEND_PLAYWRIGHT_MODULE;
 const { chromium } = await import(modulePath ? pathToFileURL(resolve(modulePath)).href : 'playwright');
 const browser = await chromium.launch({ chromiumSandbox: true, executablePath: process.env.FRONTEND_BROWSER || undefined });
 const origin = 'https://frontend-benchmark.invalid';
-const csp = "default-src 'none'; img-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; sandbox allow-scripts";
+// A sandboxed form needs allow-forms even to dispatch a local, canceled submit event.
+// form-action 'none' still prohibits submission destinations and the route allowlist stays in force.
+const csp = "default-src 'none'; img-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; sandbox allow-scripts allow-forms";
 const results = [];
 try {
   for (const width of [375, 768, 1280]) {
@@ -76,7 +78,10 @@ try {
         await page.screenshot({ path: join(out, label + '-before.png') });
         const action = page.getByRole('button', { name: spec.action, exact: true })
           .or(page.getByRole('checkbox', { name: spec.action, exact: true }))
-          .or(page.getByRole('switch', { name: spec.action, exact: true }));
+          .or(page.getByRole('switch', { name: spec.action, exact: true }))
+          // Generated +/- disclosure indicators can enter the accessible name.
+          // Accept a state glyph only for an initially collapsed native disclosure.
+          .or(page.getByRole('button', { name: spec.action + ' +', exact: true, expanded: false }));
         record.actionCount = await action.count();
         if (record.actionCount !== 1) throw new Error('expected one named action');
         record.actionBounds = await action.boundingBox();

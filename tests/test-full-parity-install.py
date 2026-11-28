@@ -36,6 +36,109 @@ class FullParity(unittest.TestCase):
                                '--global' if host == 'codex' else '--claude-skills', *flags],
                               env=self.env, text=True, capture_output=True)
 
+    def test_selected_shared_restore_refuses_edits_and_reverses_only_owned_changes(self):
+        flag = '--shared-skills=creative-frontend-engineering,acceptance-validation'
+        prior = self.home / '.claude/skills/acceptance-validation/SKILL.md'
+        source = self.repo / '.claude/skills/acceptance-validation/SKILL.md'
+        later = source.read_bytes()
+        previous = later + b'\nPrevious revision\n'
+        source.write_bytes(previous)
+        initial = self.install('claude', '--shared-skills=acceptance-validation')
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        source.write_bytes(later)
+        foreign = self.home / '.claude/skills/unrelated/SKILL.md'
+        foreign.parent.mkdir(parents=True)
+        foreign.write_text('Other provider')
+        run = self.install('claude', flag)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        backup = max((self.home / '.claude/backups/coding-agent-environment').iterdir())
+        restore = '--restore-shared=' + backup.name
+        new = self.home / '.claude/skills/creative-frontend-engineering/SKILL.md'
+        installed = new.read_bytes()
+        new.write_text('Owner edit')
+        self.assertNotEqual(self.install('claude', flag, restore).returncode, 0)
+        self.assertEqual(new.read_text(), 'Owner edit')
+        self.assertNotEqual(prior.read_bytes(), previous)
+        new.write_bytes(installed)
+        for _ in range(2):
+            result = self.install('claude', flag, restore)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(new.exists())
+        self.assertEqual(prior.read_bytes(), previous)
+        self.assertEqual(foreign.read_text(), 'Other provider')
+
+    def test_selected_refuses_foreign_file_and_newer_mode_on_both_hosts(self):
+        flag = '--shared-skills=creative-frontend-engineering'
+        for host in ('claude', 'codex'):
+            path = self.home / ('.' + host) / 'skills/creative-frontend-engineering/SKILL.md'
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b'foreign')
+            self.assertNotEqual(self.install(host, flag).returncode, 0)
+            self.assertEqual(path.read_bytes(), b'foreign')
+            self.assertFalse((path.parent / 'references').exists())
+            path.unlink()
+            self.assertEqual(self.install(host, flag).returncode, 0)
+            backup, = (self.home / ('.' + host) / 'backups/coding-agent-environment').iterdir()
+            path.chmod(0o640)
+            self.assertNotEqual(self.install(host, flag, '--restore-shared=' + backup.name).returncode, 0)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+
+    def test_restored_backup_cannot_revert_a_later_install(self):
+        flag = '--shared-skills=creative-frontend-engineering'
+        self.assertEqual(self.install('claude', flag).returncode, 0)
+        backup, = (self.home / '.claude/backups/coding-agent-environment').iterdir()
+        restore = '--restore-shared=' + backup.name
+        self.assertEqual(self.install('claude', flag, restore).returncode, 0)
+        self.assertEqual(self.install('claude', flag).returncode, 0)
+        self.assertEqual(self.install('claude', flag, restore).returncode, 0)
+        self.assertEqual(self.install('claude', flag, '--check').returncode, 0)
+
+    def test_pending_upgrade_refuses_edit_outside_its_changes(self):
+        flag = '--shared-skills=creative-frontend-engineering'
+        self.assertEqual(self.install('claude', flag).returncode, 0)
+        location = self.repo / '.claude/skills/creative-frontend-engineering'
+        with (location / 'references/direction.md').open('a') as stream:
+            stream.write('Updated direction.\n')
+        script = self.repo / 'scripts/shared-skill-transaction.py'
+        original = script.read_text()
+        script.write_text(original.replace("        if info(path) != target:", "        raise SystemExit(91)\n        if info(path) != target:"))
+        self.assertEqual(self.install('claude', flag).returncode, 91)
+        adopted = self.home / '.claude/skills/creative-frontend-engineering/SKILL.md'
+        adopted.write_text('Independent edit')
+        script.write_text(original)
+        self.assertNotEqual(self.install('claude', flag).returncode, 0)
+        self.assertEqual(adopted.read_text(), 'Independent edit')
+
+    def test_process_exit_during_publication_leaves_only_journaled_skill_files(self):
+        flag = '--shared-skills=creative-frontend-engineering'
+        script = self.repo / 'scripts/profile-install.sh'
+        original = script.read_text()
+        for host, injected in [('claude', 'os._exit(92)\n            publish(name, path)'),
+                               ('codex', 'publish(name, path)\n            os._exit(92)')]:
+            script.write_text(original.replace('            publish(name, path)', '            ' + injected))
+            self.assertEqual(self.install(host, flag).returncode, 92)
+            script.write_text(original)
+            backup, = (self.home / ('.' + host) / 'backups/coding-agent-environment').iterdir()
+            self.assertEqual(self.install(host, flag).returncode, 0)
+            self.assertEqual(self.install(host, flag, '--restore-shared=' + backup.name).returncode, 0)
+            self.assertFalse(any(p.is_file() for p in (self.home / ('.' + host) / 'skills').rglob('*')))
+
+    def test_interrupted_selected_apply_resumes_original_backup(self):
+        flag = '--shared-skills=creative-frontend-engineering'
+        script = self.repo / 'scripts/shared-skill-transaction.py'
+        original = script.read_text()
+        script.write_text(original.replace("        if info(path) != target:", "        raise SystemExit(91)\n        if info(path) != target:"))
+        self.assertEqual(self.install('claude', flag).returncode, 91)
+        backup, = (self.home / '.claude/backups/coding-agent-environment').iterdir()
+        self.assertEqual(json.loads((backup / 'shared-restore.json').read_text())['state'], 'pending')
+        script.write_text(original)
+        for _ in range(2):
+            result = self.install('claude', flag)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(backup.parent.iterdir()), [backup])
+        self.assertEqual(self.install('claude', flag, '--restore-shared=' + backup.name).returncode, 0)
+        self.assertFalse(any((self.home / '.claude/skills').rglob('*.md')))
+
     def test_claude_policy_flag_writes_only_the_managed_block(self):
         policy = self.home / '.claude/CLAUDE.md'
         policy.parent.mkdir(parents=True)
