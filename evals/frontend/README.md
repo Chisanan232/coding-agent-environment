@@ -32,3 +32,7 @@ The output directory must be new. Set `FRONTEND_PLAYWRIGHT_MODULE` to a local Pl
 ## Critique and decision
 
 Compare equivalent widths and states side by side, preferably with treatment labels hidden. Give a short observable reason per axis. Use 0 for failure, 1 for passable, 2 for clearly effective. Score composition, typography, art direction, interaction quality, task usability and accessibility. Check copy and contrast manually alongside the recorded focus styles, action bounds and motion state. Record token and wall-clock deltas separately. A small single-model sample supports a bounded routing decision only. A practical improvement must survive the essential interaction, responsive and accessibility checks for its intended task. Record unrun arms, deficits and the reviewer relationship explicitly.
+
+### Perceptual evidence control
+
+Run `node evals/frontend/perceptual-control.mjs` with the existing local Playwright and browser (same `FRONTEND_PLAYWRIGHT_MODULE` and `FRONTEND_BROWSER` overrides as the rendering harness). This independent fixture samples three displaced poses. A child moves behind an opaque foreground; the measured transform changes and its final pixels stay identical to rest. Reject a visible-motion claim for those frames. Removing the occluder makes the frames differ and verifies sensitivity of the control. Ordinary-playback perception and artistic quality remain unverified by that positive result. The fixture needs no generators, downloads or full campaign.

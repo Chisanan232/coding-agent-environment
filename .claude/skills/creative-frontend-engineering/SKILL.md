@@ -2,7 +2,7 @@
 name: creative-frontend-engineering
 description: Translate an approved frontend direction into a product flow, motion system, interaction, real-time scene, or rendered verification task.
 metadata:
-  version: "2"
+  version: "3"
 ---
 
 # Creative frontend engineering
@@ -14,9 +14,9 @@ The selected design primary owns art direction. Open only the implementation or 
 | Question at hand | Open this local reference |
 |---|---|
 | What should the viewer notice, understand and do? How should the product behave before and after the action? | [Direction and product architecture](references/direction.md) |
-| How should a drag interrupt an animation, a scroll advance a scene, or a loop return to its start? | [Motion and input](references/motion.md) |
-| How should a camera move, a shader respond, or an original asset be produced and delivered? | [Scenes and assets](references/scenes.md) |
-| What evidence would distinguish a polished interaction from a convincing still? | [Rendered critique](references/critique.md) |
+| How should a child lag a moving parent, a drag interrupt motion, or a loop return to its start? | [Motion and input](references/motion.md) |
+| Which cues belong in the artwork, surface simulation, lighting and camera? | [Scenes and assets](references/scenes.md) |
+| Can a viewer identify the intended change in ordinary playback? | [Rendered critique](references/critique.md) |
 
 Implement the smallest complete path through the intended experience. Inspect the actual output against the brief. Change the first visible or behavioral discrepancy and compare the same state again. Identify the runtime, inputs and limits of each claim.
 
