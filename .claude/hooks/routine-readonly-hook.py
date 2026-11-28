@@ -426,7 +426,9 @@ def ok_script(args, cwd):
     name = os.path.basename(path)
     if name not in TRUSTED_SCRIPT_ARGS:
         return False
-    rest = [a for a in args[1:] if a not in ("--json",)]
+    rest = [a for a in args[1:] if a != "--json"]
+    if rest and rest[-1] == ".":  # the rtk rewrite appends a bare ` .` to some commands (measured with the host matrix); it names nothing here
+        rest = rest[:-1]
     if name == "disk-admission.py":
         return rest in (["status"], ["queue", "status"])
     if name == "memory-admission.py":
@@ -447,7 +449,7 @@ def ok_pytest(args):
 
 
 SIMPLE_READ = {"cat", "head", "tail", "wc", "nl", "cut", "tr", "echo", "printf", "df", "du", "ls", "stat", "file", "pwd", "basename", "dirname",
-               "realpath", "readlink", "diff", "cmp", "shasum", "md5", "column", "jq", "sleep", "true", "false", "test", "[", "uname", "whoami",
+               "realpath", "readlink", "break", "continue", "diff", "cmp", "shasum", "md5", "column", "jq", "sleep", "true", "false", "test", "[", "uname", "whoami",
                "uptime", "vm_stat", "tree", "rev", "paste", "comm", "expand", "fold", "od", "xxd", "seq", "which"}
 RTK_NATIVE = {"ls", "tree", "find", "wc", "df", "du", "diff", "cat", "head", "tail"}
 
