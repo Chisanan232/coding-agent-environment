@@ -445,7 +445,7 @@ def git_option_dangerous(a):
     return a.startswith("-O") or a == "-h"
 
 
-GIT_HELPER_KEYS = r"^(core\.(fsmonitor|pager)|diff\..*(external|textconv)|gpg\.|log\.showsignature)"
+GIT_HELPER_KEYS = r"^(core\.(fsmonitor|pager|alternaterefscommand)|pager\.|filter\.|diff\..*(external|textconv|command)|diff\.external|gpg\.|log\.showsignature)"
 
 
 def git_config_runs_helpers(cwd):
@@ -459,19 +459,20 @@ def git_config_runs_helpers(cwd):
 
 
 def ok_git(args, cwd):
-    i = 0
+    i, eff = 0, cwd
     while i < len(args) and args[i].startswith("-"):
         if args[i] in ("--no-pager", "--no-optional-locks", "--no-replace-objects"):
             i += 1
         elif args[i] == "-C" and i + 1 < len(args):
             secret_hit(tilde(args[i + 1]), cwd)
+            eff = os.path.realpath(os.path.join(eff, tilde(args[i + 1])))
             i += 2
         else:
             return False
     if i >= len(args) or args[i] not in GIT_READ:
         return False
     verb, rest = args[i], args[i + 1:]
-    if any(git_option_dangerous(a) for a in rest) or "--show-signature" in rest or git_config_runs_helpers(cwd):
+    if any(git_option_dangerous(a) for a in rest) or "--show-signature" in rest or git_config_runs_helpers(eff):
         return False
     if verb == "branch":
         takes_pattern = ("--contains", "--merged", "--no-merged", "--list", "-l")
