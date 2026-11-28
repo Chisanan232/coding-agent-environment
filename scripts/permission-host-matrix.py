@@ -233,12 +233,12 @@ def rescore(result, corpus):
     return {"mode": result.get("mode"), "rescored": True, "score": score(entries), "cases": entries}
 
 
-def run_case(c, work, settings, live, timeout):
+def run_case(c, work, settings, live, timeout, mode="auto"):
     log = work / f"log-{c['id']}.jsonl"
     healthy, events = True, set()
     for _attempt in range(2):
         log.write_text("")
-        argv = ["claude", "-p", "--permission-mode", "auto", "--no-session-persistence", "--settings", str(settings)]
+        argv = ["claude", "-p", "--permission-mode", mode, "--no-session-persistence", "--settings", str(settings)]
         if not live:
             argv += ["--setting-sources", "project,local"]
         try:
@@ -270,6 +270,8 @@ def main(argv=None):
     ap.add_argument("--limit", type=int)
     ap.add_argument("--out")
     ap.add_argument("--timeout", type=int, default=240)
+    ap.add_argument("--permission-mode", default="auto", choices=("auto", "default"),
+                    help="default: unruled commands prompt instead of reaching the auto classifier (headless auto never prompts, so it cannot show a Remote Control prompt)")
     a = ap.parse_args(argv)
     if not (a.candidate or a.live or a.rescore):
         ap.error("one of --candidate, --live or --rescore FILE is required")
@@ -305,8 +307,8 @@ def main(argv=None):
         settings.write_text(json.dumps(cfg))
         t0 = time.time()
         with cf.ThreadPoolExecutor(a.par) as ex:
-            entries = list(ex.map(lambda c: run_case(c, work, settings, a.live, a.timeout), corpus))
-    result = {"mode": "live" if a.live else "candidate", "secs": int(time.time() - t0), "score": score(entries), "cases": entries}
+            entries = list(ex.map(lambda c: run_case(c, work, settings, a.live, a.timeout, a.permission_mode), corpus))
+    result = {"mode": "live" if a.live else "candidate", "permission_mode": a.permission_mode, "secs": int(time.time() - t0), "score": score(entries), "cases": entries}
     text = json.dumps(result, indent=1)
     if a.out:
         pathlib.Path(a.out).write_text(text)
