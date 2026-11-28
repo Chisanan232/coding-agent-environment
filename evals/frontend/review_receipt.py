@@ -28,11 +28,11 @@ def _sha(data):
 
 
 def approved_bytes(host, artifact, receipt, *, stage, reviewer, trusted_receipts,
-                   source_index, sources, reviewed_items):
+                   source_index, sources, reviewed_receipt):
     """Return the exact artifact or None. Trust inputs come from the separate review.
 
-    reviewed_items is the item-ID to assessment-text mapping for this artifact
-    from its independently approved record, not a map supplied by the candidate.
+    reviewed_receipt is the separately authenticated, frozen independent decision.
+    Keep its item identities, artifact and evidence bindings together.
     The first-pass spelling exists only for replaying the archived draft decision.
     """
     if not receipt or _sha(receipt) not in trusted_receipts or host not in {"claude", "codex"}:
@@ -47,6 +47,10 @@ def approved_bytes(host, artifact, receipt, *, stage, reviewer, trusted_receipts
 
     try:
         record = _object(receipt)
+        reviewed = _object(reviewed_receipt)
+        for field in ("stage", "reviewer", "independent", "source_index_sha256"):
+            if reviewed[field] != record[field]:
+                return None
         if (record["stage"] != stage or record["independent"] is not True
                 or not reviewer or record["reviewer"] != reviewer
                 or not isinstance(record["reviewer_role"], str) or not record["reviewer_role"].strip()):
@@ -61,7 +65,9 @@ def approved_bytes(host, artifact, receipt, *, stage, reviewer, trusted_receipts
             return None
         if any(not isinstance(value, str) or not value.strip() for value in items.values()):
             return None
-        if items != reviewed_items:
+        # Match the entire host-specific decision (including artifact identity,
+        # digest and item assessments) to the independently retained approval.
+        if report != reviewed["reports"][host]:
             return None
 
         if record["source_index_sha256"] != _sha(source_index):

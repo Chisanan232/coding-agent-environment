@@ -23,13 +23,19 @@ class ReleaseReviewTest(unittest.TestCase):
                        "reviewer_role": "Independent reviewer", "source_index_sha256": digest(self.index),
                        "reports": {"claude": self.report}}
 
+        self.approval = json.dumps(self.record).encode()
+
     def deliver(self, raw=None, **changes):
         if raw is None:
             raw = json.dumps(self.record).encode()
         args = dict(stage="final", reviewer="peer", trusted_receipts={digest(raw)},
-                    source_index=self.index, sources=self.sources, reviewed_items=self.items)
+                    source_index=self.index, sources=self.sources, reviewed_receipt=self.approval)
         args.update(changes)
         return approved_bytes("claude", self.artifact, raw, **args)
+
+    def assert_invalid_structure(self, raw=None):
+        candidate = raw if raw is not None else json.dumps(self.record).encode()
+        self.assertIsNone(self.deliver(candidate, reviewed_receipt=candidate))
 
     def test_valid(self):
         self.assertEqual(self.deliver(), self.artifact)
@@ -39,7 +45,7 @@ class ReleaseReviewTest(unittest.TestCase):
             with self.subTest(item=item):
                 self.report["claim_assessments"] = self.items.copy()
                 del self.report["claim_assessments"][item]
-                self.assertIsNone(self.deliver())
+                self.assert_invalid_structure()
 
     def test_unrelated_extra_or_replacement(self):
         for substitute in ("Closing logistics", "Closing summary", "Closing ", "closing"):
@@ -47,9 +53,9 @@ class ReleaseReviewTest(unittest.TestCase):
                 assessments = self.items.copy()
                 assessments[substitute] = "Logistics reviewed"
                 self.report["claim_assessments"] = assessments
-                self.assertIsNone(self.deliver())
+                self.assert_invalid_structure()
                 del assessments["Closing"]
-                self.assertIsNone(self.deliver())
+                self.assert_invalid_structure()
 
     def test_duplicate_json_ids_rejected_before_overwrite(self):
         raw = json.dumps(self.record).encode()
@@ -61,17 +67,17 @@ class ReleaseReviewTest(unittest.TestCase):
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, raw)
-                self.assertIsNone(self.deliver(raw.replace(fragment, duplicate)))
+                self.assert_invalid_structure(raw.replace(fragment, duplicate))
 
     def test_missing_malformed_or_blank_assessment(self):
         for value in (None, True, {}, [], "", " \n", 12):
             with self.subTest(value=value):
                 self.report["claim_assessments"]["Closing"] = value
-                self.assertIsNone(self.deliver())
+                self.assert_invalid_structure()
         for container in ([], "Closing", None):
             self.report["claim_assessments"] = container
-            self.assertIsNone(self.deliver())
-        self.assertIsNone(self.deliver(b'{'))
+            self.assert_invalid_structure()
+        self.assert_invalid_structure(b'{')
 
     def test_text_assigned_to_wrong_review_item(self):
         assessments = self.report["claim_assessments"]
@@ -87,6 +93,18 @@ class ReleaseReviewTest(unittest.TestCase):
                 self.assertIsNone(self.deliver())
                 self.report[field] = saved
         self.assertIsNone(self.deliver(stage="first-pass"))
+
+    def test_coordinated_substitution_against_frozen_approval(self):
+        self.artifact = b"Substituted report"
+        self.report["sha256"] = digest(self.artifact)
+        self.assertIsNone(self.deliver())
+
+        self.artifact = b"Final observations"
+        self.report["sha256"] = digest(self.artifact)
+        self.sources = {"frames": b"substituted evidence"}
+        self.index = json.dumps({"frames": digest(self.sources["frames"])}).encode()
+        self.record["source_index_sha256"] = digest(self.index)
+        self.assertIsNone(self.deliver())
 
     def test_trust_and_evidence_binding(self):
         self.assertIsNone(self.deliver(trusted_receipts=set()))
