@@ -16,11 +16,14 @@ stay local and are referenced by path only. See
 - [ ] Rendered composition and interaction match the selected task mode and references
 - [ ] Representative motion frames and reduced-motion end state checked where relevant
 
-For claimed creative improvements, add one row per cue and representative viewport. Review the unannotated full frame at 1× before opening diagnostic crops.
+For material claims about improvement, absence or artistic quality, add one row per cue and representative viewport. Review the unannotated full frame at 1× before opening diagnostic crops.
 
-| Intended cue, location and time | Matched clips, reviewed interval and viewport | Reviewer, method and cue independently identified? | Regressions and artistic verdict |
+| Claim and source evidence | Viewport, interval and location | Observer, method and unaided finding | Supported conclusion, unknowns and regressions |
 |---|---|---|---|
 | | | | |
+
+- [ ] Independent claim reviewer recorded their identity, disposition and the exact final report or digest, including its summary. Attach the decision and retain any rejected draft.
+- [ ] The delivered report matches the approved text and evidence. Corrections received independent review. Record the owner’s artistic decision separately.
 
 ## iOS
 
