@@ -64,7 +64,7 @@
       }
     },
     "frontend": {
-      "version": 1,
+      "version": 2,
       "packages": {
         "frontend-design": {
           "state": "active",

@@ -76,6 +76,10 @@ System or the user's need justifies it, and say why in the design brief.
 9. **Independent review.** A separate reviewer (agent or human) checks the rendered result against the brief and checklist.
 10. **Deliver** with the completed [QA checklist](templates/UI-QA-CHECKLIST.md) and local screenshot paths, not uploaded images.
 
+### Claims about creative motion or material changes
+
+Require matched before-and-after recordings at normal viewing scale and 1× speed for representative viewports. Record the visible cue, location, time, evidence, unaided viewer observation and regressions for each claim. Use independent critique when supported and disclose its viewing method. Keep implementation, functional and numerical results separate from perceptual effectiveness and artistic judgment. A change seen only in diagnostic views is perceptually negligible in the assessed ordinary view. Missing ordinary-playback evidence leaves perception unverified. Record the owner’s artistic decision separately.
+
 ## Platform QA
 
 ### Web
