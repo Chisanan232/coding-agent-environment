@@ -95,6 +95,13 @@ class Bash(unittest.TestCase):
                 self.assertEqual(hook.decide({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": t})[0], "ask", cmd)
             self.assertTrue(hook.decide({"tool_name": "Bash", "tool_input": {"command": "cat n*.txt"}, "cwd": t})[0])
 
+    def test_cd_through_a_symlink_and_dotdot(self):
+        with tempfile.TemporaryDirectory() as t:
+            os.makedirs(os.path.join(t, "real", "sub"))
+            os.symlink(os.path.expanduser("~/.ssh"), os.path.join(t, "link"))
+            for cmd in ("cd link && ls", "cd link/.. && cat .ssh/config", "cd real/sub/../../link; cat config"):
+                self.assertNotEqual(hook.decide({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": t})[0], True, cmd)
+
     def test_other_tools_untouched(self):
         self.assertIsNone(decide("Edit", file_path="x"))
 

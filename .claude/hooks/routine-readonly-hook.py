@@ -696,7 +696,7 @@ def classify_command(src, cwd):
                 if len(seg_words) > 2 or (len(seg_words) == 2 and seg_words[1].startswith("-")):
                     failed = failed or (False, "cd form")
                     continue
-                nxt = os.path.realpath(os.path.join(cur, tilde(seg_words[1]))) if len(seg_words) == 2 else HOME
+                nxt = os.path.normpath(os.path.join(cur, tilde(seg_words[1]))) if len(seg_words) == 2 else HOME  # bash -L: logical path; secret_hit also checks the resolved one
                 if secret_hit(nxt, cur):
                     return False, "secret"
                 cur = nxt

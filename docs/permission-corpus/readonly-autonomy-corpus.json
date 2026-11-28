@@ -229,8 +229,8 @@
   {
    "id": "033-protected",
    "family": "readonly-autonomy-protected",
-   "class": "OWNER_ASK",
-   "expect": "ask",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "classifier",
    "cmd": "grep -r fixture_token ."
   },
   {
