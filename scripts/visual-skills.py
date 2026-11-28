@@ -388,6 +388,16 @@ def reconcile_frontend(args: argparse.Namespace, home: Path, base: Path, catalog
     receipt = receipt_for(receipt_path) or {'owner': OWNER, 'version': 1, 'active': {}}
     if not isinstance(receipt.get('active'), dict):
         raise VisualSkillsError('Malformed frontend ownership receipt.')
+    # A pre-release updater staged links inside discovery. Such an alias has no
+    # recorded ownership of its name. Report it rather than silently adopting it.
+    for host in ('.agents', '.claude', '.codex'):
+        directory = home / host / 'skills'
+        reject_symlink_chain(directory, home)
+        for alias in directory.glob('.visual-skills-[0-9]*'):
+            if alias.is_symlink():
+                link = (alias.parent / os.readlink(alias)).resolve()
+                if base.resolve() in link.parents:
+                    raise VisualSkillsError(f'Unrecorded frontend discovery alias requires reconciliation: {alias.name}')
     current = receipt['active']
     pending = receipt.get('pending')
     desired = {name: {key: spec[key] for key in ('revision', 'integrity', 'skill_path')}
@@ -433,13 +443,13 @@ def reconcile_frontend(args: argparse.Namespace, home: Path, base: Path, catalog
         reject_symlink_chain(target.parent, home)
         if owned_link_state(target, owned) != before:
             raise VisualSkillsError('Frontend target changed while staging. Preserving it.')
-        if wanted is None:
-            target.unlink()  # Only the verified, receipt-owned link.
-        elif before is None:
+        if before is not None:
+            target.unlink()  # The pending journal preserves the previous pin.
+        if wanted is not None:
+            # Claude also discovers hidden skill directories. Publish only the final
+            # name; retry can fill an interrupted gap and never replaces a new entrant.
             target.parent.mkdir(parents=True, exist_ok=True)
             target.symlink_to(wanted)
-        else:
-            set_link(target, wanted)
     for name in catalog:
         wanted = frontend_target(base, home, name, desired[name], True) if name in desired else None
         for host in ('.agents', '.claude'):

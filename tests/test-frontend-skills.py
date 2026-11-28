@@ -105,11 +105,20 @@ class FrontendLifecycle(unittest.TestCase):
         self.assertTrue(all(p.resolve() == first for p in self.targets))
         self.assertEqual(foreign.read_text(), 'unrelated')
 
+    def test_unrecorded_legacy_discovery_alias_is_preserved_and_reported(self):
+        self.run_mode()
+        alias = self.targets[1].parent / '.visual-skills-1234'
+        alias.symlink_to(self.targets[1].resolve())
+        for action in ('check', 'rollback', 'apply'):
+            with self.assertRaisesRegex(visuals.VisualSkillsError, 'Unrecorded frontend discovery alias'):
+                self.run_mode(action)
+            self.assertTrue(alias.is_symlink())
+
     def test_interruption_recovers_both_hosts(self):
         self.run_mode()
         self.configure('second')
         count = 0
-        original = visuals.set_link
+        original = Path.symlink_to
 
         def interrupt(target, wanted):
             nonlocal count
@@ -118,14 +127,21 @@ class FrontendLifecycle(unittest.TestCase):
                 raise KeyboardInterrupt
             original(target, wanted)
 
-        with patch.object(visuals, 'set_link', interrupt), self.assertRaises(KeyboardInterrupt):
+        with patch.object(Path, 'symlink_to', interrupt), self.assertRaises(KeyboardInterrupt):
             self.run_mode()
         self.assertIn('pending', json.loads((self.base / 'receipt.json').read_text()))
+        self.assertFalse(os.path.lexists(self.targets[1]))
+        self.assertTrue(all(not list(p.parent.glob('.visual-skills-*')) for p in self.targets))
         self.assertEqual(self.run_mode('check'), 1)
         self.run_mode()
         self.assertTrue(all((p / 'SKILL.md').read_text() == 'second' for p in self.targets))
         self.run_mode('rollback')
         self.assertTrue(all((p / 'SKILL.md').read_text() == 'first' for p in self.targets))
+        self.spec['state'] = 'quarantined'
+        self.manifest()
+        self.run_mode()
+        for target in self.targets:
+            self.assertEqual(list(target.parent.iterdir()), [])
 
     def test_bad_integrity_and_foreign_state_fail_before_activation(self):
         self.spec['integrity'] = 'sha256:' + '0' * 64
