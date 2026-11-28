@@ -25,6 +25,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 
@@ -34,7 +35,7 @@ LOG = os.environ.get("ROUTINE_READONLY_HOOK_LOG") or os.path.join(HOME, ".cache/
 # --------------------------------------------------------------------------- secret paths
 _SECRET_RE = re.compile("|".join([
     r"(^|/)[^/]*\.env(rc)?$", r"(^|/)\.(vault-token|boto|s3cfg|oci|gradle|m2|zsh_sessions|bash_sessions|aws-vault|cargo/credentials(\.toml)?)(/|$)",
-    r"(^|/)\.(codex|gemini|wrangler|stripe|vercel|composer|ngrok2?|bundle|huggingface|databrickscfg|snowsql|pnpmrc|mysql_history|rediscli_history|sqlite_history|irb_history|viminfo)(/|$)",
+    r"(^|/)\.(codex|gemini|wrangler|stripe|vercel|composer|ngrok2?|bundle|huggingface|databrickscfg|snowsql|pnpmrc|sentryclirc|dockercfg|openai|fly|cursor|windsurf|mysql_history|rediscli_history|sqlite_history|irb_history|viminfo)(/|$)",
     r"(^|/)\.cache/(gh|gcloud)(/|$)", r"(^|/)(gradle\.properties|settings\.xml|\.cargo/credentials)$", r"(^|/)\.env\.(?!(example|sample|template|dist|defaults?)$)[^/]+$",
     r"(^|/)\.(ssh|aws|gnupg|kube|azure|docker|terraform\.d|op)(/|$)", r"(^|/)\.config(/|$)", r"(^|/)\.local/share/(keyrings|gh)(/|$)",
     r"(^|/)\.(netrc|npmrc|yarnrc|pypirc|pgpass|git-credentials|terraformrc|my\.cnf|gitconfig|envrc)$",
@@ -199,6 +200,8 @@ def tokenize(src):
                 raise Reject("brace")
             raise Reject("brace")
         if ch == "~" and not started:
+            if i + 1 < n and src[i + 1] not in " \t\n/;&|<>":
+                raise Reject("tilde form")  # ~user, ~+ and ~- expand to directories this parser does not model
             lit("~"); i += 1; continue
         if ch in ";&|()<>":
             two = src[i:i + 2]
@@ -442,6 +445,19 @@ def git_option_dangerous(a):
     return a.startswith("-O") or a == "-h"
 
 
+GIT_HELPER_KEYS = r"^(core\.(fsmonitor|pager)|diff\..*(external|textconv)|gpg\.|log\.showsignature)"
+
+
+def git_config_runs_helpers(cwd):
+    """Repo or global config that makes status/diff/log run a program (fsmonitor, external diff, textconv, gpg, pager): judged from the config itself."""
+    try:
+        r = subprocess.run(["git", "-C", cwd, "config", "--get-regexp", GIT_HELPER_KEYS], capture_output=True, text=True, timeout=2,
+                           env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": HOME, "GIT_TERMINAL_PROMPT": "0"})
+    except Exception:  # noqa: BLE001
+        return True
+    return bool(r.stdout.strip())
+
+
 def ok_git(args, cwd):
     i = 0
     while i < len(args) and args[i].startswith("-"):
@@ -455,7 +471,7 @@ def ok_git(args, cwd):
     if i >= len(args) or args[i] not in GIT_READ:
         return False
     verb, rest = args[i], args[i + 1:]
-    if any(git_option_dangerous(a) for a in rest):
+    if any(git_option_dangerous(a) for a in rest) or "--show-signature" in rest or git_config_runs_helpers(cwd):
         return False
     if verb == "branch":
         takes_pattern = ("--contains", "--merged", "--no-merged", "--list", "-l")
@@ -485,6 +501,8 @@ def ok_gh(args):
     pos = [a for a in args[:2]]
     if len(pos) < 2 or tuple(pos) not in GH_READ:
         return False
+    if any("://" in a or re.match(r"^[^/=\s]+\.[^/\s]+/[^/]+/[^/]+", a) or a.count("/") > 1 and not a.startswith(("-", ".", "/")) for a in args[2:]):
+        return False  # a URL or HOST/OWNER/REPO operand points gh at another host
     # --jq/--template evaluate an expression that can read the environment; --web opens a browser; nothing else is needed for a read
     return flags_ok(args[2:], short="LsSRlc0123456789", long_exact=("--comments", "--name-only", "--patch", "--stat", "--watch", "--failed", "--log-failed",
                     "--verbose", "--exit-status"), long_prefix=("--json=", "--repo=", "--limit=", "--state=", "--search=", "--author=", "--label=", "--base=", "--head=",
@@ -503,6 +521,8 @@ def no_cargo_wrapper(cwd):
         d = os.path.dirname(d)
     dirs.append(HOME)
     for d in dirs:
+        if os.path.exists(os.path.join(d, "rust-toolchain.toml")) or os.path.exists(os.path.join(d, "rust-toolchain")):
+            return False  # the rustup proxy may download a toolchain
         for name in ("config.toml", "config"):
             f = os.path.join(d, ".cargo", name)
             try:
@@ -653,12 +673,12 @@ def judge(argv, cwd, state):
     return False
 
 
-PROTECTED_VAR = re.compile(r"^(HOME|PATH|IFS|SHELL|ENV|BASH_ENV|PS[0-9]|PROMPT_COMMAND|CDPATH|GLOBIGNORE|GIT_|LD_|DYLD_|PYTHON|PYTEST_|CARGO_|RUST|RTK_|NODE_|NPM_|PAGER|EDITOR|VISUAL|LESS|TMPDIR|XDG_|LC_|LANG|OLDPWD|PWD)")
+PROTECTED_VAR = re.compile(r"^(HOME|PATH|CDPATH|FPATH|MANPATH|MODULE_PATH|IFS|SHELL|ENV|BASH_ENV|PS[0-9]|PROMPT|PROMPT_COMMAND|GLOBIGNORE|FIGNORE|GIT_|GH_|GITHUB_|LD_|DYLD_|PYTHON|PYTEST_|CARGO_|RUST|RIPGREP|RTK_|NODE_|NPM_|PAGER|EDITOR|VISUAL|LESS|TMPDIR|XDG_|LC_|LANG|OLDPWD|PWD|SSH_|AWS_|AZURE_|GOOGLE_|CLOUDSDK|DOCKER_|KUBE|SSL_|CURL_|HTTPS?_PROXY|ALL_PROXY|NO_PROXY|BROWSER|HIST|ZDOT|ZSH|BASH|USER|LOGNAME|TERM)", re.I)
 KILLERS = {"pkill", "killall", "kill"}
 WORKTREE_MUTATING = {"add", "remove", "prune", "move", "lock", "unlock", "repair"}
 COARSE_DANGER = re.compile(
-    r"\b(pkill|killall|kill)\b|\brm\s+(-\S*[rRf]\S*|--rec\S*|--force)|worktree\s+(add|remove|prune|move)|\bgit\b.*\bpush\b.*(--force|--delete|--mirror|\s-f\b|\s\+\S)"
-    r"|reset\s+--hard|\bgit\s+clean\b|gh\s+pr\s+merge|\bfind\b.*-delete|xargs\s+(\S+\s+)*rm\b")
+    r"\b(pkill|killall|kill)\b|\brm\b.*\s(-\S*[rRf]\S*|--rec\S*|--force)|worktree\s+(add|remove|prune|move)|\bgit\b.*\bpush\b.*(--force|--delete|--mirror|\s-f\b|\s\+\S)"
+    r"|reset\s+--ha|\bgit\b.*\b(clean|restore)\b|gh\b.*\bpr\b.*\bmerge\b|\bfind\b.*-delete|xargs\s+(\S+\s+)*rm\b")
 
 
 def danger(words):
@@ -673,7 +693,7 @@ def danger(words):
         raise AskNeeded("recursive-or-forced-delete")
     if prog == "find" and "-delete" in args:
         raise AskNeeded("find-delete")
-    if prog == "gh" and args[:2] in (["pr", "merge"], ["repo", "delete"], ["release", "delete"]):
+    if prog == "gh" and (("pr" in args and "merge" in args) or ("repo" in args and "delete" in args) or ("release" in args and "delete" in args)):
         raise AskNeeded("gh-destructive")
     if prog == "git":
         i = 0
@@ -682,11 +702,12 @@ def danger(words):
         verb, rest = (args[i], args[i + 1:]) if i < len(args) else ("", [])
         if verb == "worktree" and rest[:1] and rest[0] in WORKTREE_MUTATING:
             raise AskNeeded("worktree-change")
-        if verb == "push" and any(a in ("-f", "-d") or a.startswith(("--force", "--delete", "--mirror", "+")) or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("fd")) for a in rest):
+        if verb == "push" and any(a in ("-f", "-d") or a.startswith(("--force", "--delete", "--mirror", "+", ":")) or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("fd")) for a in rest):
             raise AskNeeded("force-or-delete-push")
-        if verb == "reset" and "--hard" in rest or verb == "clean":
+        if verb == "reset" and any(a.startswith("--ha") for a in rest) or verb in ("clean", "restore") or verb == "checkout" and any(a in ("-f", "--force", "--", ".") for a in rest) \
+                or verb == "update-ref" and "-d" in rest or verb == "gc" and any(a.startswith("--prune") for a in rest):
             raise AskNeeded("discard-work")
-        if verb == "branch" and any(a in ("-D", "-d", "--delete") for a in rest) or verb == "tag" and any(a in ("-d", "--delete") for a in rest):
+        if verb == "branch" and any(a in ("--delete",) or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("dD")) for a in rest) or verb == "tag" and any(a in ("-d", "--delete") for a in rest):
             raise AskNeeded("ref-delete")
         if verb == "stash" and rest[:1] and rest[0] in ("drop", "clear"):
             raise AskNeeded("stash-delete")
@@ -716,12 +737,14 @@ def _classify(src, cwd):
             else:
                 seg.append(t)
         closed = ifs = fis = stages = 0
+        in_body = any(t[0] == "word" and t[1] in ([("lit", "do")], [("lit", "then")], [("lit", "for")], [("lit", "while")], [("lit", "until")], [("lit", "if")])
+                      for _, sg in segs for t in sg[:1])
         for op_before, seg in segs:
             if not seg:
                 continue
             if pending is not None:  # the cd before this stage may have failed: keep both directories unless `&&` guarantees it succeeded
                 old, new = pending
-                cwds = [new] if op_before == "&&" else old + [new]
+                cwds = list(dict.fromkeys(new if op_before == "&&" else old + new))
                 pending = None
             if any(t[0] == "redir" for t in seg) and not all(redir_ok(t[1], t[2], t[3], c) for c in cwds for t in seg if t[0] == "redir"):
                 failed = failed or (False, "redirect")
@@ -765,17 +788,19 @@ def _classify(src, cwd):
                 failed = failed or (False, "env prefix")
                 continue
             if first == "cd":
-                if len(seg_words) > 2 or (len(seg_words) == 2 and (seg_words[1].startswith("-") or (seg_words[1].startswith("~") and tilde(seg_words[1]) == seg_words[1]))):
-                    failed = failed or (False, "cd form")
+                if in_body or len(seg_words) > 2 or (len(seg_words) == 2 and seg_words[1].startswith("-")):
+                    failed = failed or (False, "cd form")  # a cd inside a loop or conditional body runs a number of times this parser does not model
                     continue
                 raw = tilde(seg_words[1]) if len(seg_words) == 2 else HOME
-                nxt = os.path.normpath(os.path.join(cwds[-1], raw))
-                real = os.path.realpath(nxt)
-                if ".." in raw.split("/") and real != nxt:  # logical and physical `..` disagree through a symlink: do not guess
-                    failed = failed or (False, "cd dotdot through symlink")
-                    continue
-                secret_hit(real, cwds[-1])
-                pending = (list(cwds), real)
+                news = []
+                for c in cwds:  # every directory the shell may be in at this point
+                    nxt = os.path.normpath(os.path.join(c, raw))
+                    real = os.path.realpath(nxt)
+                    if ".." in raw.split("/") and real != nxt:  # logical and physical `..` disagree through a symlink: do not guess
+                        failed = failed or (False, "cd dotdot through symlink")
+                    secret_hit(real, c)
+                    news.append(real)
+                pending = (list(cwds), news)
                 stages += 1
                 continue
             danger(seg_words)

