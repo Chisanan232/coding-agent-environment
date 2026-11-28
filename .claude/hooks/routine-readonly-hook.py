@@ -395,7 +395,7 @@ def ok_grep(args):
 
 def ok_rtk_grep(args, cwd):
     """`rtk grep` searches recursively (hidden files skipped). Allowlisted flags, no `--` and no -g/--glob (rg takes `--pre`, `--hidden` and globs that
-    re-include hidden files), and a root inside the working tree under ~/Bryant-Developments that holds no credential-named file."""
+    re-include hidden files), and a root inside a project working tree (not HOME, an ancestor of it or a scratch root) that holds no credential-named file."""
     valued = ("-e", "-m", "-A", "-B", "-C", "-t", "--max-len", "--max", "--file-type", "-l", "-T")
     if "--" in args or not flags_ok(args, short="ivnclwxqsHhoFEIa0123456789", long_exact=("--context-only", "--ultra-compact", "--ignore-case", "--invert-match",
                     "--count", "--files-with-matches", "--word-regexp", "--fixed-strings", "--line-buffered", "--no-messages", "--only-matching"),
@@ -404,10 +404,12 @@ def ok_rtk_grep(args, cwd):
     ops = operands(args, valued)
     roots = ops[1:] or ["."]  # first operand is the pattern
     base = os.path.realpath(cwd)
-    dev = os.path.realpath(os.path.join(HOME, "Bryant-Developments"))
+    broad = (os.path.realpath(HOME) + "/").startswith(base.rstrip("/") + "/") or base in ("/tmp", "/private/tmp", "/private/var/folders", "/var/folders")
+    if broad:  # a project directory only: never the home directory, one of its ancestors or a shared scratch root
+        return False
     for r in roots:
         p = os.path.realpath(os.path.join(cwd, tilde(r)))
-        if not (p == base or p.startswith(base + "/")) or not (p == dev or p.startswith(dev + "/")):
+        if not (p == base or p.startswith(base + "/")):
             return False
         tree_secret_scan(p)
     return True

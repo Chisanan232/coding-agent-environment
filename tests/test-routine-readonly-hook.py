@@ -40,7 +40,7 @@ ALLOW = [
 FALLTHROUGH = [
     "printf -vx y", "printf -- '%s' a",
     "printf -v 'a[$(echo X)]' x", "[ -v 'a[$(echo X)]' ]", "test -v x", "for PATH in /tmp; do cat x; done", "for HOME in /tmp; do ls; done", "rtk grep x . -- --pre ./a.sh",
-    "rtk grep x . -- --hidden", "rtk grep . . -g '.[e]nv'", "rtk grep . ~/Bryant-Developments", "gh pr view 1 --json body -cq env", "git diff --help", "git log -h",
+    "rtk grep x . -- --hidden", "rtk grep . . -g '.[e]nv'", "rtk grep . ~/Bryant-Developments", "rtk grep . ..", "gh pr view 1 --json body -cq env", "git diff --help", "git log -h",
     "cd ~bryant; cat .claude.json", "cargo metadata --offline --locked ; frobnicate", "env X=1 ls", "FOO=1 ls; echo hi",
     "sed -n 1p README.md > /tmp/o", "sed -i s/a/b/ README.md", "sed -n 'w /tmp/x' README.md", "sed -n '1e rm -rf /tmp/x' README.md", "sed -ni 1p README.md",
     "sed --in-pl s/a/b/ README.md", "rm sed-notes.txt", "./sed-notes.txt", "python3 sed-notes.py", "git push --force origin main", "gh pr merge 5 --repo a/b",
@@ -116,6 +116,16 @@ class Bash(unittest.TestCase):
         home = os.path.expanduser("~")
         for cmd in ("cd /nonexistent/x || cat .claude.json", "cd /nonexistent/x; cat .claude.json"):
             self.assertEqual(hook.decide({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": home})[0], "ask", cmd)
+
+    def test_rtk_grep_needs_a_project_cwd(self):
+        home = os.path.expanduser("~")
+        for cwd in (home, "/tmp", "/", "/Users"):
+            self.assertNotEqual(hook.decide({"tool_name": "Bash", "tool_input": {"command": "rtk grep x ."}, "cwd": cwd})[0], True, cwd)
+        with tempfile.TemporaryDirectory() as t:
+            pathlib.Path(t, "a.txt").write_text("x\n")
+            self.assertTrue(hook.decide({"tool_name": "Bash", "tool_input": {"command": "rtk grep x ."}, "cwd": t})[0])
+            pathlib.Path(t, "credentials.json").write_text("{}")
+            self.assertEqual(hook.decide({"tool_name": "Bash", "tool_input": {"command": "rtk grep x ."}, "cwd": t})[0], "ask")
 
     def test_other_tools_untouched(self):
         self.assertIsNone(decide("Edit", file_path="x"))
