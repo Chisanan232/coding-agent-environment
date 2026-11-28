@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 
@@ -395,7 +396,7 @@ def ok_grep(args):
 
 def ok_rtk_grep(args, cwd):
     """`rtk grep` searches recursively (hidden files skipped). Allowlisted flags, no `--` and no -g/--glob (rg takes `--pre`, `--hidden` and globs that
-    re-include hidden files), and a root inside a project working tree (not HOME, an ancestor of it or a scratch root) that holds no credential-named file."""
+    re-include hidden files), and a root inside a project working tree (strictly inside a development or scratch root, never the root itself) that holds no credential-named file."""
     valued = ("-e", "-m", "-A", "-B", "-C", "-t", "--max-len", "--max", "--file-type", "-l", "-T")
     if "--" in args or not flags_ok(args, short="ivnclwxqsHhoFEIa0123456789", long_exact=("--context-only", "--ultra-compact", "--ignore-case", "--invert-match",
                     "--count", "--files-with-matches", "--word-regexp", "--fixed-strings", "--line-buffered", "--no-messages", "--only-matching"),
@@ -404,8 +405,8 @@ def ok_rtk_grep(args, cwd):
     ops = operands(args, valued)
     roots = ops[1:] or ["."]  # first operand is the pattern
     base = os.path.realpath(cwd)
-    broad = (os.path.realpath(HOME) + "/").startswith(base.rstrip("/") + "/") or base in ("/tmp", "/private/tmp", "/private/var/folders", "/var/folders")
-    if broad:  # a project directory only: never the home directory, one of its ancestors or a shared scratch root
+    roots_real = [os.path.realpath(r) for r in READ_ROOTS]
+    if base in roots_real or not any(base.startswith(r + "/") for r in roots_real):  # strictly inside a known development or scratch root, never the root itself
         return False
     for r in roots:
         p = os.path.realpath(os.path.join(cwd, tilde(r)))
@@ -830,7 +831,31 @@ JIRA_BASES = ("searchJiraIssuesUsingJql", "getJiraIssue", "createJiraIssue", "ed
               "getJiraIssueRemoteIssueLinks")  # exactly the Jira tools the owner's settings already allow; nothing new is authorized here
 JIRA_TOOLS = {"mcp__%s__%s" % (srv, b) for srv in ("claude_ai_Atlassian_Rovo", "plugin_atlassian_atlassian") for b in JIRA_BASES}
 INTERNAL_TOOLS = {"ScheduleWakeup", "ReadNotifications", "ToolSearch"}  # resume this session / read its own queue / load tool schemas: no effect outside it
-PEER = re.compile(r"^(uds:/tmp/cc-socks/\d+\.sock|[0-9a-f]{8,40}|[A-Za-z0-9_.-][A-Za-z0-9_. -]{0,63})$")
+PEER_SOCK = re.compile(r"^uds:(/tmp/cc-socks/\d+\.sock)$")
+SUBAGENT_ID = re.compile(r"^[0-9a-f]{16,40}$")
+READ_ROOTS = (os.path.join(HOME, "Bryant-Developments"), "/tmp", "/private/tmp", "/private/var/folders", os.path.join(HOME, ".cache/coding-agent-environment"),
+              os.path.join(HOME, ".cargo/shared-target"), os.path.join(HOME, "Library/Application Support/rtk/tee"))
+
+
+def local_peer(to):
+    """A subagent id, or a Claude Code session socket under /tmp/cc-socks that exists and is owned by this user (the owner's own local sessions)."""
+    if SUBAGENT_ID.match(to):
+        return True
+    m = PEER_SOCK.match(to)
+    if not m:
+        return False
+    try:
+        st = os.stat(m.group(1))
+    except OSError:
+        return False
+    return stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid()
+
+
+def read_root_ok(path, cwd):
+    p = os.path.realpath(os.path.join(cwd, path))
+    roots = [os.path.realpath(cwd)] if os.path.realpath(cwd) not in (os.path.realpath(HOME), "/") else []
+    roots += [os.path.realpath(r) for r in READ_ROOTS]
+    return any(p == r or p.startswith(r + "/") for r in roots)
 SECRET_TEXT = re.compile(r"ghp_[A-Za-z0-9]{20,}|github_pat_|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|xox[abp]-|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{10,}\.")
 
 
@@ -853,6 +878,8 @@ def decide(event):
             return "ask", "credential-path"
         except Reject:
             return False, "unjudgeable-path"
+        if not read_root_ok(tilde(path), cwd):
+            return None, "read-outside-project-roots"  # the normal permission decision applies
         return True, "native-read"
     if tool in INTERNAL_TOOLS:
         return True, "internal-" + tool
@@ -860,9 +887,9 @@ def decide(event):
         to, text = str(tin.get("to", "")), json.dumps(tin)
         if SECRET_TEXT.search(text):
             return "ask", "credential-in-message"
-        if PEER.match(to):
+        if local_peer(to):
             return True, "internal-message"
-        return False, "message-target-not-internal"
+        return False, "message-target-not-a-known-local-peer"
     if tool in JIRA_TOOLS:
         return (True, "authorized-jira") if not SECRET_TEXT.search(json.dumps(tin)) else ("ask", "credential-in-jira-write")
     return None, "tool-not-covered"

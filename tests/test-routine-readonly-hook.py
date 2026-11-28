@@ -148,13 +148,15 @@ class OtherTools(unittest.TestCase):
         self.assertEqual(decide("Read", file_path=os.path.expanduser("~/.ssh/id_rsa")), "ask")
         self.assertEqual(decide("Read", file_path=os.path.expanduser("~/.claude/settings.json")), "ask")
         self.assertEqual(decide("Read", file_path="/x/app/.env"), "ask")
-        self.assertTrue(decide("Read", file_path="/x/app/.env.example"))
+        self.assertTrue(decide("Read", file_path=str(ROOT / ".env.example")))
+        self.assertIsNone(decide("Read", file_path="/etc/hosts"))  # outside the project roots: the normal decision applies
 
     def test_internal_and_jira(self):
         for tool in ("ScheduleWakeup", "ReadNotifications", "ToolSearch"):
             self.assertTrue(decide(tool, prompt="x", delaySeconds=60))
-        self.assertTrue(decide("SendMessage", to="uds:/tmp/cc-socks/70026.sock", message="status"))
-        self.assertTrue(decide("SendMessage", to="ab688205e1e64e3b", message="status"))
+        self.assertFalse(decide("SendMessage", to="uds:/tmp/cc-socks/1.sock", message="status"))  # no such socket
+        self.assertFalse(decide("SendMessage", to="alice", message="status"))
+        self.assertTrue(decide("SendMessage", to="ab688205e1e64e3bf", message="status"))
         self.assertFalse(decide("SendMessage", to="bridge:session_01X", message="x"))
         self.assertEqual(decide("SendMessage", to="peer", message="token ghp_" + "a" * 30), "ask")
         self.assertTrue(decide("mcp__claude_ai_Atlassian_Rovo__transitionJiraIssue", issueIdOrKey="X-1"))
