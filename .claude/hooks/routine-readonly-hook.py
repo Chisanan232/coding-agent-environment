@@ -333,6 +333,10 @@ def ok_sed(args):
             scripts.append(args[i + 1]); i += 2; continue
         if a == "-l":
             i += 2; continue
+        if a.startswith("-e") and len(a) > 2 and not a.startswith("--"):  # attached script: -e1p
+            scripts.append(a[2:]); i += 1; continue
+        if a.startswith("-l") and len(a) > 2 and not a.startswith("--"):
+            i += 1; continue
         if a.startswith("--expression="):
             scripts.append(a.split("=", 1)[1])
         elif not (a.startswith("-") and a != "-"):
@@ -359,7 +363,7 @@ def ok_awk(args):
             return False
         prog = a
         break
-    return prog is not None and not re.search(r"system|getline|ENVIRON|\||>(?!=)|close\s*\(|fflush|@|/dev/", prog)
+    return prog is not None and not re.search(r"system|getline|ENVIRON|ARGV|ARGC|\||>(?!=)|close\s*\(|fflush|@|/dev/", prog)
 
 
 def ok_find(args):
@@ -434,8 +438,12 @@ def ok_git(args, cwd):
     if any(git_option_dangerous(a) for a in rest):
         return False
     if verb == "branch":
+        takes_pattern = ("--contains", "--merged", "--no-merged", "--list", "-l")
+        for j, a in enumerate(rest):
+            if not a.startswith("-") and not (j and rest[j - 1] in takes_pattern):
+                return False  # a bare name would create a branch
         return flags_ok([a for a in rest if a.startswith("-")], short="avrl", long_exact=("--list", "--show-current", "--no-color", "--all", "--remotes", "--verbose",
-                        "--contains", "--merged", "--no-merged"), long_prefix=("--sort=", "--format=", "--color=")) and not has_flag(rest, "-u", prefix=("-u",))
+                        "--contains", "--merged", "--no-merged"), long_prefix=("--sort=", "--format=", "--color="))
     if verb == "tag":
         return all(a in ("-l", "--list") or not a.startswith("-") for a in rest) and (not rest or rest[0] in ("-l", "--list"))
     if verb == "stash":
@@ -518,7 +526,15 @@ def ok_diff(args):
 
 
 def ok_tree(args):
-    return flags_ok(args, short="adfFCniD", long_exact=("--noreport",), valued=("-L", "-I", "-P"))
+    """`-L N` as two words only; no other valued flag (tree's own parser is not getopt, so a clustered valued flag cannot be judged)."""
+    rest, i = [], 0
+    while i < len(args):
+        if args[i] == "-L" and i + 1 < len(args) and args[i + 1].isdigit():
+            i += 2
+            continue
+        rest.append(args[i])
+        i += 1
+    return flags_ok(rest, short="adfFCniD", long_exact=("--noreport",))
 
 
 SIMPLE_FLAGS = {  # program -> (short letters, valued flags)
@@ -676,8 +692,11 @@ def classify_command(src, cwd):
                 continue
             if ASSIGN.match(first):
                 return False, "env prefix"
-            if first == "cd" and len(seg_words) == 2 and not seg_words[1].startswith("-"):
-                nxt = os.path.normpath(os.path.join(cur, tilde(seg_words[1])))
+            if first == "cd":
+                if len(seg_words) > 2 or (len(seg_words) == 2 and seg_words[1].startswith("-")):
+                    failed = failed or (False, "cd form")
+                    continue
+                nxt = os.path.realpath(os.path.join(cur, tilde(seg_words[1]))) if len(seg_words) == 2 else HOME
                 if secret_hit(nxt, cur):
                     return False, "secret"
                 cur = nxt

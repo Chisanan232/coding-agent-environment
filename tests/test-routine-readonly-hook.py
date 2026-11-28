@@ -50,13 +50,13 @@ FALLTHROUGH = [
     "python3 %s/scripts/memory-admission.py check --reserve x" % CWD, "cat <<EOF\nx\nEOF", "(cat README.md)", "rtk read README.md --skip-env", "date -s 1200",
     "cat a # '\nrm -rf /tmp/zz\n# '", "PATH=/tmp/bin; ls", "GIT_EXTERNAL_DIFF=/tmp/x; git diff", "IFS=a; ls", "HOME=/x; cat ~/known_hosts", "diff -rN /nonexistent ~",
     "diff -r ~ /tmp", "grep --rec -n AKIA ~", "grep --dir=recurse x ~", "grep -r x .", "rtk grep -. foo ~", "rtk grep foo ~", "rtk grep foo /etc", "tree -ao /tmp/x",
-    "tree --output=/tmp/x", "file -C -m /tmp/x", "cd -", "echo a;; echo b",
+    "tree --output=/tmp/x", "file -C -m /tmp/x", "cd -", "cd -P x", "git branch newname", "git branch -f x", "awk 'BEGIN{ARGV[1]=\".env\"}1' README.md", "tree -I -o x", "echo a;; echo b",
 ]
 ASK = [
     "git worktree add ../x", "rtk git worktree add ../x", "git -C /tmp/r worktree remove x", "pkill -TERM -f foo", "kill 99999", "rm -rf build", "rm -f x", "rtk proxy pkill x",
     "cat README.md; git worktree add ../x", "frobnicate; pkill x",  # credential stores: never silent, never a hook allow; the owner can authorize a disclosure
     "cat ~/.ssh/id_rsa", "cat .env", "cat config/production.env", "cat app.env", "cat ~/.claude/settings.json", "rtk read ~/.claude.json", "cat *.pem", "cat ~/.ss?/id_rsa",
-    "git show HEAD:.env", "git show HEAD:config/prod.env", "cat ~/.vault-token", "cat ~/.boto", "cat ~/.m2/settings.xml", "cat ~/.zsh_sessions/x", "cat ~/.zshrc", "cat /dev/stdin",
+    "git show HEAD:.env", "git show HEAD:config/prod.env", "cat ~/.vault-token", "cat ~/.boto", "cat ~/.m2/settings.xml", "cat ~/.zsh_sessions/x", "cat ~/.zshrc", "cd; cat .ssh/config", "cat /dev/stdin",
     "grep x ~/.aws/credentials", "file -f.env x", "cat --  ~/.ssh/config", "cd ~/.ssh && ls", "S='a b'; cat $S",
 ]
 
